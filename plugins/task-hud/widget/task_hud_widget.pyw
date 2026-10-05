@@ -2002,15 +2002,33 @@ def merge_session(sid: str, m: dict | None, t: dict | None, info: dict | None, n
     return None
 
 
-def pick_usage(mods) -> dict | None:
-    best = None
-    for m in mods:
-        u = m.get('usage')
-        upd = num(m.get('updatedAt')) or 0
-        if isinstance(u, dict) and (isinstance(u.get('fiveHour'), dict) or isinstance(u.get('sevenDay'), dict)):
-            if best is None or upd > best[0]:
-                best = (upd, u)
-    return best[1] if best else None
+def pick_usage(mods, now: int) -> dict | None:
+    """每個用量條各自挑讀數。各工作階段的用量只在它自己收到回應時更新，閒置的工作階段帶著舊讀數照樣每 15 秒重寫檔案，
+    所以不能看檔案新舊：還沒到期的時段只有一個，裡面的百分比只增不減，取最大的；都沒有 resetsAt（舊版引擎）才取最新的檔案；
+    全都過了重置時間就留著重置時間最晚的那個，讓用量條顯示「已重置」"""
+    out = {}
+    for key in ('fiveHour', 'sevenDay'):
+        live, bare, gone = None, None, None
+        for m in mods:
+            u = m.get('usage')
+            lim = u.get(key) if isinstance(u, dict) else None
+            if not isinstance(lim, dict):
+                continue
+            pct = num(lim.get('pct'))
+            at = parse_ts(lim.get('resetsAt'))
+            upd = num(m.get('updatedAt')) or 0
+            if at is None:
+                if bare is None or upd > bare[0]:
+                    bare = (upd, lim)
+            elif at <= now:
+                if gone is None or at > gone[0]:
+                    gone = (at, lim)
+            elif pct is not None and (live is None or pct > live[0]):
+                live = (pct, lim)
+        best = live or bare or gone
+        if best is not None:
+            out[key] = best[1]
+    return out or None
 
 
 def sort_key(s: dict):
@@ -2501,7 +2519,7 @@ class Collector:
             for s in sessions:
                 s.update(localId=None, unread=False, scheduled=False)
         sessions.sort(key=sort_key)
-        return {'at': now, 'sessions': sessions, 'usage': pick_usage(mods.values())}
+        return {'at': now, 'sessions': sessions, 'usage': pick_usage(mods.values(), now)}
 
 
 # ---------- 完成提示 ----------
@@ -4567,6 +4585,28 @@ def selftest_registry(tmp: str, check) -> None:
 
 def selftest_misc(tmp: str, check) -> None:
     now = now_ms()
+    # 用量：閒置的工作階段帶著舊讀數照樣每 15 秒重寫檔案，不能因為檔案比較新就蓋過別人的新讀數
+    r5, r7, gone = iso(now + 3600_000), iso(now + 2 * 86400_000), iso(now - 60_000)
+
+    def um(upd, five=None, seven=None):
+        return {'updatedAt': upd, 'usage': {k: v for k, v in (('fiveHour', five), ('sevenDay', seven)) if v is not None}}
+    live = [um(now - 6_000, {'pct': 92, 'resetsAt': r5}, {'pct': 24, 'resetsAt': r7}),
+            um(now, {'pct': 8, 'resetsAt': r5}, {'pct': 2, 'resetsAt': r7}),
+            um(now - 1_000, {'pct': 39, 'resetsAt': r5}, {'pct': 10, 'resetsAt': r7})]
+    for order in (live, live[::-1], live[1:] + live[:1]):
+        u = pick_usage(order, now)
+        check(u == {'fiveHour': {'pct': 92, 'resetsAt': r5}, 'sevenDay': {'pct': 24, 'resetsAt': r7}}, f'stale idle readings ignored {u}')
+    u = pick_usage([um(now, {'pct': 92, 'resetsAt': gone}), um(now - 9_000, {'pct': 3, 'resetsAt': iso(now + 5 * 3600_000)})], now)
+    check(u == {'fiveHour': {'pct': 3, 'resetsAt': iso(now + 5 * 3600_000)}}, f'expired window loses to the new one {u}')
+    u = pick_usage([um(now, {'pct': 92, 'resetsAt': gone})], now)
+    check(u == {'fiveHour': {'pct': 92, 'resetsAt': gone}}, f'only expired readings: kept so the meter shows 已重置 {u}')
+    u = pick_usage([um(now - 5_000, {'pct': 70}), um(now, {'pct': 20})], now)
+    check(u == {'fiveHour': {'pct': 20}}, f'no resetsAt (older engine): newest file wins {u}')
+    u = pick_usage([um(now, {'pct': 99}), um(now - 5_000, {'pct': 42, 'resetsAt': r5})], now)
+    check(u == {'fiveHour': {'pct': 42, 'resetsAt': r5}}, f'reading with a window beats one without {u}')
+    u = pick_usage([um(now, {'pct': 50, 'resetsAt': r5}), um(now - 5_000, None, {'pct': 20, 'resetsAt': r7})], now)
+    check(u == {'fiveHour': {'pct': 50, 'resetsAt': r5}, 'sevenDay': {'pct': 20, 'resetsAt': r7}}, f'each meter on its own {u}')
+    check(pick_usage([um(now), {'updatedAt': now, 'usage': None}, {}], now) is None, 'no usage at all')
     # 新版 mod：lastDone 帶 kind='all'，只在它變新時提示；durationMs < 10 秒只閃不叫
     run = {'state': 'running', 'startedAt': now - 90_000, 'updatedAt': now, 'lastDone': None, 'tasks': [
         {'id': 'turn:1', 'kind': 'turn', 'label': '問題', 'status': 'running', 'startedAt': now - 60_000},
