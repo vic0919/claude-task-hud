@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+
+# 本機產生的引擎型別（Claude Code 載入 mod 或 /plugin-types 時寫的）／locally generated engine types
+plugins/*/.claude-plugin/types/
+
+# 型別檢查用的暫存 tsconfig／scratch tsconfig for type-checking
+tsconfig.json
+
+# 在這個 repo 裡開 Claude Code 時產生的本機設定與型別／local Claude Code settings and generated types
+.claude/
+
+# 記錄檔／logs
+*.log
+
+# 作業系統與編輯器／OS and editor files
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+node_modules/

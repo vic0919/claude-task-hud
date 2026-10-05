@@ -1,0 +1,3 @@
+# 文字檔一律用 LF 存進 repo 與取出（Windows 上 core.autocrlf=true 也一樣）／keep text files LF everywhere
+* text=auto eol=lf
+*.png binary
