@@ -61,6 +61,7 @@ if sys.version_info < MIN_PYTHON:
 
 # 可調整的設定
 REFRESH_MS = 1000
+BTN_GUARD_MS = 600  # 視窗剛出現或剛移動後這段時間內按到標題列的按鈕不算：那是游標底下突然冒出來的
 FRESH_MS = 45_000  # mod 檔多久內算新鮮
 ENDED_KEEP_MS = 10 * 60_000  # 已結束的工作階段顯示多久
 RESUME_SLACK_MS = 15_000  # 結束後 transcript 又有寫入，視為重新開啟
@@ -1998,6 +1999,10 @@ def merge_session(sid: str, m: dict | None, t: dict | None, info: dict | None, n
     if view == 'mod':
         return session_from_mod(sid, m, info, now, reg)
     if view == 'tx' and info is not None and t is not None:
+        # 檔案時間是新的、內容卻是好幾天前的（transcript 被別的程式碰過，例如刪掉工作階段時）：行程也不在，就不算最近有活動
+        newest = info.get('newestTs')
+        if newest is not None and now - newest > RECENT_MS and not reg:
+            return None
         return session_from_tx(sid, t, info, now, m, bg, reg, reg_on)
     return None
 
@@ -2991,6 +2996,9 @@ class App:
         self._spin_id = None
         self._drag = None
         self._fit_key = None
+        self._pos = None  # 視窗目前在螢幕上的位置
+        self._moved_at = 0.0  # 視窗出現或移動的時間（BTN_GUARD_MS）
+        self._btn_armed = None  # 在這個標題列按鈕上按下、放開時才動作
         self._hdr_bg = HDR_BG
         self._body_packed = False
         self._more_packed = False
@@ -3034,6 +3042,7 @@ class App:
         self.render(None)
         self._place()
         root.deiconify()
+        self._moved_at = time.time()
         save_config(self.cfg_path, self.cfg)
         self.worker = threading.Thread(target=self._work, daemon=True)
         self.worker.start()
@@ -3103,8 +3112,10 @@ class App:
             w.bind('<B1-Motion>', self._drag_move)
             w.bind('<ButtonRelease-1>', self._drag_end)
             w.bind('<Double-Button-1>', lambda e: self.toggle_collapse())
-        for btn, fn in ((self.btn_close, self.close_by_user), (self.btn_min, self.toggle_collapse), (self.btn_mode, self.toggle_mode)):
-            btn.bind('<Button-1>', lambda e, f=fn: f())
+        for btn, fn in ((self.btn_close, lambda: self.close_by_user('標題列的 ✕')), (self.btn_min, lambda: self.toggle_collapse()),
+                        (self.btn_mode, lambda: self.toggle_mode())):
+            btn.bind('<ButtonPress-1>', lambda e, b=btn: self._btn_press(b))
+            btn.bind('<ButtonRelease-1>', lambda e, b=btn, f=fn: self._btn_release(e, b, f))
             btn.bind('<Enter>', lambda e, b=btn: b.configure(fg=FG, bg=HOVER))
             btn.bind('<Leave>', lambda e, b=btn: b.configure(fg=self._mode_fg() if b is self.btn_mode else DIM, bg=self._hdr_bg))
 
@@ -3153,7 +3164,7 @@ class App:
         m.add_cascade(label='透明度', menu=sub)
         m.add_separator()
         m.add_command(label='重新整理', command=self.force_refresh)
-        m.add_command(label='結束', command=self.close_by_user)
+        m.add_command(label='結束', command=lambda: self.close_by_user('右鍵選單的「結束」'))
         return m
 
     def _place(self):
@@ -3182,6 +3193,9 @@ class App:
         self._fit_key = key
         nx, ny = clamp_rect(x, y, self.W, h, screen_area(root, x + self.W // 2, y + 10))
         root.geometry(f'+{nx}+{ny}')
+        if (nx, ny) != self._pos:  # 長高時往上推：標題列的按鈕跟著移到別的地方
+            self._pos = (nx, ny)
+            self._moved_at = time.time()
 
     # ----- 背景收集 -----
 
@@ -3671,6 +3685,7 @@ class App:
         self.show_count += 1
         root.deiconify()
         root.lift()
+        self._moved_at = time.time()
         root.attributes('-topmost', True)
         if not self.cfg['topmost']:
             root.after(400, lambda: root.attributes('-topmost', False))
@@ -3683,7 +3698,18 @@ class App:
             self._fit(force=True)
         self.show_flash_until = time.time() + 1.5
 
-    def close_by_user(self):
+    def _btn_press(self, btn):
+        self._btn_armed = btn if (time.time() - self._moved_at) * 1000 >= BTN_GUARD_MS else None
+        if self._btn_armed is None:
+            Log.write('標題列按鈕：視窗剛出現或剛移動，這一下不算')
+
+    def _btn_release(self, e, btn, fn):
+        armed, self._btn_armed = self._btn_armed, None
+        if armed is btn and 0 <= e.x < btn.winfo_width() and 0 <= e.y < btn.winfo_height():  # 按下後移開再放開：取消
+            fn()
+
+    def close_by_user(self, how: str = '結束'):
+        Log.write(f'使用者關閉懸浮視窗（{how}）；之後不再自動開啟，用 /task-float 重新打開')
         self.cfg['autoOpen'] = False
         save_config(self.cfg_path, self.cfg)
         self.shutdown()
@@ -3826,6 +3852,10 @@ def build_fixtures(tmp: str, now: int) -> dict:
     })
     tx('tx-old', [user('tx-old', now - 8 * 3600_000, 'old'),
                   asst('tx-old', now - 8 * 3600_000, text('ok'), 'end_turn')], now - 7 * 3600_000)
+    # 一週前停在回合中間（最後是背景通知）的舊工作階段，檔案時間卻是剛剛（被別的程式碰過）
+    tx('tx-dormant', [user('tx-dormant', now - 7 * 86400_000, 'old prompt'),
+                      user('tx-dormant', now - 7 * 86400_000 + 60_000, '<task-notification>\n<task-id>b1</task-id>\n</task-notification>')],
+       now - 60_000)
     _jsonl(os.path.join(pdir, 'tx-idle', 'subagents', 'agent-1.jsonl'),
            [user('agent-1', now - 3_000, 'deep')], now - 3_000)
 
@@ -5598,6 +5628,10 @@ def selftest(replay: str | None = None) -> int:
               and s['attn']['since'] == now - 20_000, f'mod-attn {s}')
         check([r['label'] for r in task_lines(s)] == ['等你核准：Bash 刪除暫存檔'] and task_lines(s)[0]['attn'], f'mod-attn lines {task_lines(s)}')
         check('tx-old' not in by and 'agent-1' not in by and 'bad' not in by, 'old / deep / broken files excluded')
+        check('tx-dormant' not in by, f"newest entry a week old: not recent despite a fresh mtime {by.get('tx-dormant')}")
+        td = c.list_transcripts(now)['tx-dormant']
+        s = merge_session('tx-dormant', None, td, c.infer(td), now, None, [{'start': now - 8 * 86400_000, 'status': 'idle'}], True)
+        check(s is not None, 'dormant transcript still shown while its Claude Code process is alive')
         check(by['tx-custom']['title'] == 'My Custom Title', f"full-scan title {by['tx-custom']}")
         check(by['tx-big']['title'] == 'big prompt', f"big file skipped {by['tx-big']}")
         check(c.full_scans == 1, f'full scans {c.full_scans}')
@@ -5987,6 +6021,27 @@ def smoke(port: int, seconds: float) -> int:
                        attn_alerts=app.attn_alert_count, sounds=list(app.sounds))
             app.shutdown()
 
+        def close_guard():
+            # ✕ 要按下、放開都在它上面才算；視窗剛出現或剛移動時按到的也不算（游標底下突然冒出視窗）
+            calls = []
+            app.close_by_user = lambda how='': calls.append(how)
+            b = app.btn_close
+            bx, by = b.winfo_rootx() + 3, b.winfo_rooty() + 3
+
+            def click(rel_x=3):
+                b.event_generate('<ButtonPress-1>', x=3, y=3, rootx=bx, rooty=by)
+                b.event_generate('<ButtonRelease-1>', x=rel_x, y=3, rootx=bx + rel_x - 3, rooty=by)
+            app._moved_at = time.time()
+            click()
+            fresh = list(calls)
+            app._moved_at = time.time() - 5
+            click(rel_x=-40)
+            away = list(calls)
+            click()
+            res['close_guard'] = fresh == [] and away == [] and calls == ['標題列的 ✕']
+            del app.close_by_user
+
+        app.root.after(int(ms * 0.15), close_guard)
         app.root.after(int(ms * 0.2), header_pulse)
         app.root.after(int(ms * 0.3), bump)
         app.root.after(int(ms * 0.35), ask)
@@ -6001,7 +6056,7 @@ def smoke(port: int, seconds: float) -> int:
         app.root.after(ms, finish)
         app.run()
         ok = (res.get('sessions', 0) > 0 and res.get('rows', 0) > 0 and res.get('alerts', 0) >= 1
-              and res.get('shown', 0) == 1 and res.get('fit') and res.get('drag')
+              and res.get('shown', 0) == 1 and res.get('fit') and res.get('drag') and res.get('close_guard')
               and res.get('lines', 0) > 0 and res.get('rfit') and res.get('mode') == 'running'
               and res.get('attn_rows', 0) >= 3 and res.get('attn_lines', 0) >= 6 and res.get('frames', 0) >= 2
               and res.get('hdr') and res.get('attn_alerts', 0) >= 1 and 'attention' in res.get('sounds', [])
@@ -6012,7 +6067,8 @@ def smoke(port: int, seconds: float) -> int:
               f"h={res.get('rh')} fit={res.get('rfit')} saved={res.get('mode')} "
               f"needs-you rows={res.get('attn_rows')} lines={res.get('attn_lines')} pulse-frames={res.get('frames')} "
               f"header-pulse={res.get('hdr')} attention-alerts={res.get('attn_alerts')} sounds={res.get('sounds')} "
-              f"unread-header={res.get('unread_hdr')} scheduled-dim={res.get('sched')} unread={res.get('unread')}")
+              f"unread-header={res.get('unread_hdr')} scheduled-dim={res.get('sched')} unread={res.get('unread')} "
+              f"close-guard={res.get('close_guard')}")
         return 0 if ok else 1
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -6063,6 +6119,8 @@ def main(argv=None) -> int:
         inst = None
     quiet_console()
     set_dpi_aware()
+    # 之後只有開始、沒有「使用者關閉」那一行，就是被外部結束的（沒有錯誤記錄也沒有當機紀錄）
+    Log.write(f'懸浮視窗啟動：pid {os.getpid()}{"，自動開啟" if args.auto else ""}，{os.path.abspath(__file__)}')
     try:
         App(data_dir, projects_dir, inst).run()
     except Exception:
