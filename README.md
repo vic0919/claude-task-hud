@@ -53,7 +53,7 @@ A floating, always-on-top task and usage HUD for Claude Code. [English below ↓
 
 **完成提示**——一個工作階段的工作「全部」結束（包含背景工作）並靜置幾秒之後才提示：那一列閃綠色 12 秒（有錯誤閃紅色），並發出兩聲提示音。整段忙碌不到 10 秒就做完的只閃不叫；你自己中斷（Esc）的不提示。
 
-**背景工作**——Workflow、背景 Bash（`run_in_background`）、背景 Agent、Monitor 還在跑時，即使 Claude 的回合已經結束，工作階段仍算「執行中」，直到它們真的結束（收到完成通知）才算完成。從 transcript 推斷時，15 分鐘沒動靜的背景工作會標成「N 分鐘無動靜」。
+**背景工作**——Workflow、背景 Bash（`run_in_background`）、背景 Agent、Monitor 還在跑時，即使 Claude 的回合已經結束，工作階段仍算「執行中」，直到它們真的結束（收到完成通知）才算完成。Artifact 的自動追蹤（發佈或讀過 Artifact 之後，Claude Code 會在背景持續接收它的留言與更新）整個工作階段都開著，不算在跑的工作。從 transcript 推斷時，15 分鐘沒動靜的背景工作會標成「N 分鐘無動靜」。
 
 **沒裝外掛的工作階段**——沒有外掛資料（或資料超過 45 秒沒更新）的工作階段，會從 `~/.claude/projects` 的 transcript 唯讀推斷狀態（只看最近 6 小時有活動的）。
 
@@ -106,8 +106,8 @@ claude plugin update task-hud@claude-task-hud
 
 1. 用 `claude --version` 確認是 2.1.286 以上。
 2. 檢查安裝好的外掛資料夾，引擎拒絕載入時會列出原因（版本號換成你裝的版本）：
-   `claude plugin validate ~/.claude/plugins/cache/claude-task-hud/task-hud/0.5.2`
-   （Windows 的 cmd／PowerShell：`%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.5.2`）。也可以用 `claude --debug` 啟動，看記錄裡的 `task-hud`。
+   `claude plugin validate ~/.claude/plugins/cache/claude-task-hud/task-hud/0.5.3`
+   （Windows 的 cmd／PowerShell：`%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.5.3`）。也可以用 `claude --debug` 啟動，看記錄裡的 `task-hud`。
 3. 這個功能由 Claude Code 控制開關。可以在環境變數或 `~/.claude/settings.json` 的 `env` 裡設 `"CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1"` 強制開啟，再重新啟動 Claude Code。
 4. `--bare` 模式不會載入已安裝外掛的 hooks module；組織的 managed settings 設了 `allowManagedHooksOnly` 或 `disableAllHooks` 時也不會載入。
 
@@ -118,7 +118,7 @@ claude plugin update task-hud@claude-task-hud
 - **自動開啟**（Windows）：每個工作階段的第一個回合開始時，如果懸浮視窗沒開就自動開啟，不搶焦點。排程工作不會自動開啟；`claude -p`、SDK 等腳本啟動的工作階段也會自動開啟。
 - 按視窗右上角的 **×**（或右鍵「結束」）關閉後就不再自動開啟，之後用 `/task-float` 打開會恢復自動開啟。視窗剛出現或剛移動的 0.6 秒內按到 × 不算，免得游標底下突然冒出視窗時誤關；按下後移開再放開也會取消。
 - 建議用 `/task-float` 開啟。也可以直接執行安裝資料夾裡的程式（版本號換成你裝的版本）：
-  `pythonw "%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.5.2\widget\task_hud_widget.pyw"`
+  `pythonw "%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.5.3\widget\task_hud_widget.pyw"`
 - 懸浮視窗永遠置頂，會顯示每個工作階段的標題（第一個提示）。分享螢幕前可以先收合（**—**）或結束。
 
 ### 設定
@@ -258,7 +258,7 @@ python tools/screenshot.py docs/screenshot-all.png --mode all
 
 **Completion alert** — fires only after *all* of a session's work has finished (background work included) and stayed quiet for a few seconds: the row flashes green for 12 s (red on error) with a two-tone beep. Work that took less than 10 s in total only flashes, without the beep; sessions you interrupted yourself (Esc) don't alert.
 
-**Background work** — while a Workflow, background Bash (`run_in_background`), background Agent or Monitor is still running, the session stays "running" even after Claude's turn has ended, and only counts as done once that work really finishes (its completion notification arrives). When inferred from a transcript, background work that has been silent for 15 minutes is marked 「N 分鐘無動靜」 (no activity for N minutes).
+**Background work** — while a Workflow, background Bash (`run_in_background`), background Agent or Monitor is still running, the session stays "running" even after Claude's turn has ended, and only counts as done once that work really finishes (its completion notification arrives). An artifact watch (after Claude publishes or reads an Artifact, Claude Code keeps receiving its comments and updates in the background for the rest of the session) is not counted as running work. When inferred from a transcript, background work that has been silent for 15 minutes is marked 「N 分鐘無動靜」 (no activity for N minutes).
 
 **Sessions without the plugin** — sessions with no plugin data (or data older than 45 s) are inferred read-only from their transcripts in `~/.claude/projects` (only those active in the last 6 hours).
 
@@ -313,8 +313,8 @@ Then restart Claude Code. A floating window that is already open keeps running t
 
 1. Check `claude --version` is 2.1.286 or later.
 2. Validate the installed plugin folder; if the engine refuses the module, this says why (use the version you installed):
-   `claude plugin validate ~/.claude/plugins/cache/claude-task-hud/task-hud/0.5.2`
-   (Windows cmd / PowerShell: `%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.5.2`). You can also start `claude --debug` and look for `task-hud` in the log.
+   `claude plugin validate ~/.claude/plugins/cache/claude-task-hud/task-hud/0.5.3`
+   (Windows cmd / PowerShell: `%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.5.3`). You can also start `claude --debug` and look for `task-hud` in the log.
 3. Claude Code controls this feature with a switch. Set `"CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1"` in your environment or in the `env` block of `~/.claude/settings.json`, then restart Claude Code.
 4. `--bare` mode loads no hooks module from installed plugins, and neither do sessions whose managed (organization) settings set `allowManagedHooksOnly` or `disableAllHooks`.
 
@@ -325,7 +325,7 @@ Then restart Claude Code. A floating window that is already open keeps running t
 - **Auto-open** (Windows): when a session's first turn starts, the floating window opens if it isn't already, without stealing focus. Scheduled tasks never auto-open it; sessions started by scripts (`claude -p`, an SDK) do.
 - Closing it with **×** (or right-click → quit) turns auto-open off; opening it again with `/task-float` turns it back on. A press on × in the first 0.6 s after the window appears or moves is ignored, so a window popping up under the cursor is not closed by accident; pressing and then moving off before releasing cancels.
 - `/task-float` is the easiest way to open it. You can also run the installed copy directly (use the version you installed):
-  `pythonw "%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.5.2\widget\task_hud_widget.pyw"`
+  `pythonw "%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.5.3\widget\task_hud_widget.pyw"`
 - The window stays on top and shows every session's title (its first prompt). Collapse it (**—**) or quit it before sharing your screen.
 
 ### Configuration

@@ -136,6 +136,8 @@ ACTIVE = ('running', 'waiting', 'attention')
 MODES = ('all', 'running')
 KIND_TEXT = {'turn': 'Claude', 'tool': '工具', 'agent': 'Agent', 'shell': '背景指令', 'workflow': 'Workflow', 'monitor': '監看'}
 BG_KINDS = ('agent', 'shell', 'workflow', 'monitor')
+# Artifact 的自動追蹤：引擎把它列成背景的 monitor，整個工作階段都開著；0.5.3 以前的 mod 會把它當成在跑的「監看」
+ARTIFACT_WATCH_RE = re.compile(r'\blive updates for artifact\b|claude\.ai/(?:code/)?artifact/', re.I)
 
 DEFAULT_CFG = {
     'autoOpen': True,
@@ -1815,6 +1817,12 @@ def session_from_mod(sid: str, m: dict, info, now: int, reg=None) -> dict:
     upd = num(m.get('updatedAt')) or 0
     tasks = [x for x in m.get('tasks') if isinstance(x, dict)] if isinstance(m.get('tasks'), list) else []
     running = sorted((x for x in tasks if x.get('status') in ('running', 'pending')), key=lambda x: num(x.get('startedAt')) or 0)
+    state = m.get('state')
+    watches = [x for x in running if x.get('kind') == 'monitor' and ARTIFACT_WATCH_RE.search(str(x.get('label') or ''))]
+    if watches:
+        running = [x for x in running if x not in watches]
+        if state == 'running' and not running:
+            state = 'idle'
     ld = m.get('lastDone') if isinstance(m.get('lastDone'), dict) else None
     ld_at = num(ld.get('at')) if ld else None
     ld_text = squash(ld['text']) if ld and isinstance(ld.get('text'), str) else ''
@@ -1827,7 +1835,6 @@ def session_from_mod(sid: str, m: dict, info, now: int, reg=None) -> dict:
         'lastDoneDur': num(ld.get('durationMs')) if ld else None,
         'interrupted': False, 'isError': False, 'tasks': [], 'attn': None,
     }
-    state = m.get('state')
     attn = parse_attention(m.get('attention'), upd)
     rows: list[dict] = []
     if state == 'ended':
@@ -4642,6 +4649,15 @@ def selftest_misc(tmp: str, check) -> None:
         {'id': 'turn:1', 'kind': 'turn', 'label': '問題', 'status': 'running', 'startedAt': now - 60_000},
         {'id': 'bg:w1', 'kind': 'workflow', 'label': '整理', 'status': 'running', 'startedAt': now - 50_000},
         {'id': 'a1', 'kind': 'agent', 'label': '研究', 'status': 'running', 'startedAt': now - 40_000, 'detail': 'Grep', 'toolUseId': 'tu1'}]}
+    # 舊版 mod 把 Artifact 的自動追蹤當成背景的「監看」，工作階段一直是 running：不算
+    watch = {'id': 'bg:aw', 'kind': 'monitor', 'label': 'live updates for artifact https://claude.ai/artifact/4xa5T2…',
+             'status': 'running', 'startedAt': now - 3600_000}
+    old = {'state': 'running', 'startedAt': now - 7200_000, 'updatedAt': now, 'lastDone': None, 'tasks': [
+        {'id': 'turn:0', 'kind': 'turn', 'label': '整理專案', 'status': 'completed', 'startedAt': now - 4000_000, 'endedAt': now - 3500_000}, watch]}
+    s = session_from_mod('aw', old, None, now)
+    check(s['status'] == 'idle' and s['tasks'] == [], f'artifact watch alone is not running {s}')
+    s = session_from_mod('aw', dict(old, tasks=old['tasks'] + [run['tasks'][1]]), None, now)
+    check(s['status'] == 'running' and [r['label'] for r in s['tasks']] == ['整理'], f'artifact watch hidden next to real work {s}')
     s = session_from_mod('mm', run, None, now)
     check(s['sub'] == '問題 · 背景：整理 · 背景：研究' and [r['kind'] for r in s['tasks']] == ['turn', 'workflow', 'agent'], f'mod bg labels {s}')
     check(s['tasks'][2]['detail'] == 'Grep' and s['tasks'][1]['bg'] and not s['tasks'][0]['bg'], f'mod task rows {s["tasks"]}')

@@ -118,6 +118,10 @@ function toolLabel(tool: string, a: Record<string, unknown>): string {
   }
 }
 
+// Artifact 的自動追蹤（發佈或讀過 Artifact 後，留言與更新會通知這個工作階段）：整個工作階段都開著，不是在做事
+const isArtifactWatch = (b: { readonly type: string; readonly description?: string }) =>
+  b.type === 'monitor' && /\blive updates for artifact\b|claude\.ai\/(?:code\/)?artifact\//i.test(b.description ?? '')
+
 function kindOfSummary(type: string): HudTaskKind {
   if (type === 'shell') return 'shell'
   if (type === 'workflow') return 'workflow'
@@ -1462,15 +1466,14 @@ export const register: Register = on => {
   on('classic.Stop', async ($, e, next) => {
     const r = await next(e)
     await quietly(async () => {
-      const inFlight = e.background_tasks
-      if (inFlight === undefined) return
+      if (e.background_tasks === undefined) return
+      const inFlight = e.background_tasks.filter(b => b.type !== 'subagent' && !isArtifactWatch(b))
       const at = await $.clock.now()
       await mutate($, list => {
         let out = [...list]
         // 已經對上清單裡某個工作的列不能再被改名，同名的兩個工作才會各有一列
         const listed = new Set(inFlight.map(b => `bg:${b.id}`))
         for (const b of inFlight) {
-          if (b.type === 'subagent') continue
           const id = `bg:${b.id}`
           if (out.some(t => t.id === id)) continue
           const label = clip(b.description || b.command || b.name || b.type, 60)
@@ -1483,7 +1486,7 @@ export const register: Register = on => {
           out = [...out, { id, kind: kindOfSummary(b.type), label, status: 'running', startedAt: at }]
         }
         // 引擎說沒有任何背景工作在跑：把殘留的標成完成（漏接通知時，忙碌期才會結束）
-        if (inFlight.filter(b => b.type !== 'subagent').length === 0) {
+        if (inFlight.length === 0) {
           out = out.map(t =>
             t.id.startsWith('bg:') && isRunning(t) ? { ...t, status: 'completed', endedAt: at } : t,
           )
