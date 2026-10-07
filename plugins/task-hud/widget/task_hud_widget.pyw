@@ -78,6 +78,8 @@ EXPAND_LINES = 30  # 有展開的工作階段或 workflow 時，只看執行中�
 RUN_TASKS = 4  # 每個工作階段最多列幾個工作
 WF_AGENT_LINES = 15  # workflow 展開時最多列幾行 agent（其餘併成「+N 個已完成」）
 EXPANDED_MAX = 200  # 展開狀態最多記幾個
+RUN_MATCH_MS = 60_000  # 沒記 runDir 的 workflow：run 資料夾要在啟動後這段時間內建立
+RUN_MATCH_SLACK_MS = 5_000
 BUSY_GAP_MS = 2_500  # 推算忙碌期時容許的空檔（和 mod 的靜置時間一樣）
 BG_DONE_MAX = 64  # transcript 來源：記住最近結束的幾個背景工作（算工作階段的總進度）
 SCRIPT_HEAD = 64 * 1024  # Workflow script 只讀開頭這麼多（meta 宣告在最前面）
@@ -366,12 +368,13 @@ def load_config(path: str) -> dict:
         v = num(cfg.get(k))
         cfg[k] = int(v) if v is not None else None
     cfg['readMarks'] = clean_marks(cfg.get('readMarks'))
+    cfg['hidden'] = clean_marks(cfg.get('hidden'))
     cfg['expanded'] = clean_expanded(cfg.get('expanded'))
     return cfg
 
 
 def save_config(path: str, cfg: dict) -> None:
-    out = {k: v for k, v in cfg.items() if not (k in ('x', 'y') and v is None) and not (k in ('readMarks', 'expanded') and not v)}
+    out = {k: v for k, v in cfg.items() if not (k in ('x', 'y') and v is None) and not (k in ('readMarks', 'expanded', 'hidden') and not v)}
     try:
         write_json(path, out)
     except OSError:
@@ -431,6 +434,28 @@ def prune_marks(marks: dict, sessions, now: int) -> bool:
             drop.append(sid)
     for sid in drop:
         del marks[sid]
+    return bool(drop)
+
+
+# ---------- 從清單移除（懸浮視窗自己記的：工作階段又有新動作才再出現） ----------
+
+def act_key(s: dict) -> int:
+    """這個工作階段最後一次有動作的時間。"""
+    return int(num(s.get('lastAt')) or num(s.get('doneAt')) or 0)
+
+
+def is_hidden(s: dict, hidden: dict) -> bool:
+    at = hidden.get(s.get('sid'))
+    return at is not None and s.get('status') not in ACTIVE and act_key(s) <= at + MARK_SLACK_MS
+
+
+def prune_hidden(hidden: dict, sessions, now: int) -> bool:
+    """移除的作廢：又開始做事、有新的動作，或超過 MARK_KEEP_MS。有變動回傳 True。"""
+    by = {s.get('sid'): s for s in sessions}
+    drop = [sid for sid, at in hidden.items()
+            if now - at > MARK_KEEP_MS or ((s := by.get(sid)) is not None and not is_hidden(s, hidden))]
+    for sid in drop:
+        del hidden[sid]
     return bool(drop)
 
 
@@ -2657,6 +2682,7 @@ class Collector:
         self.live_cache: dict[str, tuple] = {}
         self.journals: dict[str, WfJournal] = {}  # workflow 的 runId → 增量讀的 journal
         self.phase_cache: dict[str, tuple] = {}  # script 路徑 → ((mtime, size), phases)
+        self.run_cache: dict[tuple, tuple] = {}  # (sid, workflow 啟動時間) → (查的時間, (run 資料夾, script) 或 None)
         self.tx_since: dict[str, tuple] = {}  # transcript 來源的工作階段 → (這段忙碌期推出來的開始時間, 最後一次還在忙的時間)
         self.wf_cache: dict[str, tuple] = {}  # runId → (依據, workflow_progress 的結果)
         self.prog_errs: set = set()  # 讀進度時出錯的檔案（同一個檔案只記一次 log）
@@ -2873,6 +2899,11 @@ class Collector:
             return
         etas = {}
         for r in s['tasks']:
+            if r.get('kind') == 'workflow' and not r.get('runDir') and r.get('startAt'):
+                found = self.find_run(s['sid'], r['startAt'], now)  # 舊版 mod 啟動的：沒記 run 資料夾，用啟動時間找
+                if found:
+                    r['runDir'], r['scriptPath'] = found
+                    r.setdefault('run', os.path.basename(found[0]))
             if r.get('kind') == 'workflow' and r.get('runDir'):
                 w = self.wf_view(r['runDir'], r.get('scriptPath'), r.get('startAt'), now, used)
                 if w is not None:
@@ -2880,6 +2911,33 @@ class Collector:
                     if w['etaAts']:
                         etas[r.get('id')] = w['etaAts'][0]
         s['prog'] = session_progress(s.get('subs') or [], any(r.get('kind') == 'turn' for r in s['tasks']), etas)
+
+    def find_run(self, sid: str, start_at: int, now: int):
+        """沒有 runDir 的 workflow：找這個工作階段裡、建立時間在啟動後 RUN_MATCH_MS 內最接近的 run 資料夾，
+        script 從 <工作階段>/workflows/scripts/*-<runId>.js 找（可能在別的專案資料夾，例如 worktree）。找不到時隔一段時間再試。"""
+        key = (sid, start_at)
+        hit = self.run_cache.get(key)
+        if hit is not None and (hit[1] is not None or now - hit[0] < BG_PROBE_MS):
+            return hit[1]
+        best = None
+        for d in glob.glob(os.path.join(glob.escape(self.projects_dir), '*', glob.escape(sid), 'subagents', 'workflows', 'wf_*')):
+            try:
+                st = os.stat(d)
+            except OSError:
+                continue
+            born = getattr(st, 'st_birthtime', st.st_ctime) * 1000
+            gap = born - start_at
+            if -RUN_MATCH_SLACK_MS <= gap <= RUN_MATCH_MS and (best is None or abs(gap) < best[0]):
+                best = (abs(gap), d)
+        found = None
+        if best is not None:
+            rid = os.path.basename(best[1])
+            sc = glob.glob(os.path.join(glob.escape(self.projects_dir), '*', glob.escape(sid), 'workflows', 'scripts', f'*-{glob.escape(rid)}.js'))
+            found = (best[1], sc[0] if sc else None)
+        self.run_cache[key] = (now, found)
+        if len(self.run_cache) > 200:
+            self.run_cache.pop(next(iter(self.run_cache)))
+        return found
 
     def _cached(self, path: str, key: str, now: int, fn) -> float:
         box = self.live_cache.setdefault(path, {})
@@ -3741,6 +3799,7 @@ class App:
         rm = tk.Menu(self.root, tearoff=0)
         rm.add_command(label='在 Claude 開啟', command=lambda: self.open_session(self._menu_sid))
         rm.add_command(label='標為已讀', command=lambda: self.mark_read(self._menu_sid))
+        rm.add_command(label='從清單移除', command=lambda: self.hide_session(self._menu_sid))
         rm.add_separator()
         self.row_menu = self._fill_menu(rm)
 
@@ -3824,6 +3883,8 @@ class App:
                 dirty = prune_marks(self.cfg['readMarks'], snap['sessions'], snap['at'])
                 if prune_expanded(self.cfg['expanded'], snap['sessions']):
                     dirty = True
+                if prune_hidden(self.cfg['hidden'], snap['sessions'], snap['at']):
+                    dirty = True
                 if dirty:
                     save_config(self.cfg_path, self.cfg)
             self.render(snap)
@@ -3869,7 +3930,7 @@ class App:
     def render(self, snap):
         now = now_ms()
         t = time.time()
-        sessions = snap['sessions'] if snap else []
+        sessions = [s for s in (snap['sessions'] if snap else []) if not is_hidden(s, self.cfg['hidden'])]
         self.flash = {k: v for k, v in self.flash.items() if v[0] > t}
         mode = self.cfg['mode']
         run = sum(1 for s in sessions if s['status'] == 'running')
@@ -4256,6 +4317,18 @@ class App:
             snap = self.snap
         self.render(snap)
 
+    def hide_session(self, sid) -> None:
+        """從清單移除：只記在懸浮視窗自己的設定裡；這個工作階段再有新動作就重新出現。"""
+        s = self._by_sid.get(sid) if sid else None
+        if s is None or s['status'] in ACTIVE:
+            return
+        self.cfg['hidden'][sid] = act_key(s) or now_ms()
+        cap_marks(self.cfg['hidden'])
+        save_config(self.cfg_path, self.cfg)
+        with self.lock:
+            snap = self.snap
+        self.render(snap)
+
     def _menu_for(self, widget):
         """右鍵選單：在工作階段上按就用多了「在 Claude 開啟」「標為已讀」的那份（不能用的項目變灰）。"""
         row = self._row_of.get(str(widget))
@@ -4266,6 +4339,7 @@ class App:
         self._menu_sid = sid
         self.row_menu.entryconfigure(0, state='normal' if desktop_url(s.get('localId')) else 'disabled')
         self.row_menu.entryconfigure(1, state='normal' if sid in self._dots else 'disabled')
+        self.row_menu.entryconfigure(2, state='disabled' if s['status'] in ACTIVE else 'normal')
         return self.row_menu
 
     def _popup(self, e):
@@ -5733,6 +5807,24 @@ def selftest_progress(tmp: str, check) -> None:
     _mod(pf['path'], m)
     s = {x['sid']: x for x in c.collect(now + 4000)['sessions']}['mod-wf']
     check('wf' not in s['tasks'][-1] and s['status'] == 'running', 'journal missing: no progress, session still shown')
+    # 舊版 mod 啟動的 workflow（沒有 runDir）：用啟動時間找 run 資料夾，script 可能在別的專案資料夾（worktree）
+    fp = os.path.join(tmp, 'fbproj')
+    frun = os.path.join(fp, 'C--repo', 'fb-sid', 'subagents', 'workflows', 'wf_fb000001-aaa')
+    os.makedirs(frun)
+    born = int(getattr(os.stat(frun), 'st_birthtime', os.stat(frun).st_ctime) * 1000)
+    fscript = os.path.join(fp, 'C--repo--claude-worktrees-x', 'fb-sid', 'workflows', 'scripts', 'demo-wf_fb000001-aaa.js')
+    os.makedirs(os.path.dirname(fscript))
+    with open(fscript, 'w', encoding='utf-8') as f:
+        f.write("export const meta = { name: 'demo', phases: [{ title: 'A' }, { title: 'B' }] }" + '\n')
+    _jsonl(os.path.join(frun, 'journal.jsonl'), [{'type': 'launched'}, S_('a1', 'fa1aaaaaaaaa', phase='A'), S_('a2', 'fa2aaaaaaaaa', phase='A'),
+                                                {'type': 'result', 'key': 'a1', 'agentId': 'fa1aaaaaaaaa'}], born)
+    fc = Collector(os.path.join(tmp, 'fbdata'), fp)
+    check(fc.find_run('fb-sid', born - 1000, born) == (frun, fscript) and fc.find_run('fb-sid', born - 120_000, born + 1) is None
+          and fc.find_run('other', born, born) is None, 'run folder found by start time')
+    row = {'id': 'bg:fb', 'kind': 'workflow', 'label': 'wf', 'startAt': born - 1000, 'bg': True}
+    fs = {'sid': 'fb-sid', 'status': 'running', 'tasks': [row], 'subs': []}
+    fc.add_progress(fs, born + 1000, set())
+    check(row.get('run') == 'wf_fb000001-aaa' and (row.get('wf') or {}).get('label') == '階段 1/2 · 25%', f'old-mod workflow gets progress {row}')
 
     # 只看執行中模式的展開：順序、agent 15 行上限與「+N 個已完成」、30 行上限、在等你的列仍然保留
     def ag(i, status):
@@ -6636,6 +6728,15 @@ def selftest_desktop(tmp: str, check, fx: dict) -> None:
     check(cq['readMarks'] == {}, 'bad readMarks')
     save_config(cfgq, cq)
     check('readMarks' not in read_json(cfgq), 'empty readMarks not written')
+    # 從清單移除：沒在跑、沒有新動作就藏著；又有動作或開始跑就作廢
+    hs = {'sid': 'h1', 'status': 'idle', 'lastAt': 1_000_000, 'doneAt': 1_000_000}
+    hid = {'h1': 1_000_000}
+    check(is_hidden(hs, hid) and not is_hidden(dict(hs, status='running'), hid) and not is_hidden(dict(hs, lastAt=1_100_000), hid)
+          and not is_hidden(hs, {}), 'hidden session')
+    check(not prune_hidden(hid, [hs], 1_000_001) and prune_hidden(hid, [dict(hs, lastAt=1_100_000)], 1_100_001) and hid == {}, 'hidden pruned')
+    check(not prune_hidden({'gone': 5}, [], 6) and prune_hidden({'gone': 5}, [], 5 + MARK_KEEP_MS + 1), 'hidden expires')
+    write_json(cfgq, {'hidden': {'a': 5, 'b': 'x'}})
+    check(load_config(cfgq)['hidden'] == {'a': 5}, 'hidden cleaned on load')
 
     # 問句：「(?)」是存疑的標記；外掛的 AskUserQuestion 沒有問題文字時不要變成「等你回覆：Claude 有問題要問你」
     check(question_label('這個數字對嗎(?)') is None and question_label('大概 3 秒（？）') is None

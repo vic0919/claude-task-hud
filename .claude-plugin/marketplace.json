@@ -11,7 +11,7 @@
       "name": "task-hud",
       "source": "./plugins/task-hud",
       "description": "懸浮小視窗顯示所有工作階段的任務狀態與用量，Claude 等你回覆時醒目標示、工作完成時提示 / Always-on-top floating window listing every Claude Code session's status and usage, highlighting sessions waiting for your reply and alerting on completion",
-      "version": "0.6.0",
+      "version": "0.6.1",
       "author": {
         "name": "vic0919",
         "url": "https://github.com/vic0919"

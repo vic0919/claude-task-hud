@@ -23,7 +23,7 @@ A floating, always-on-top task and usage HUD for Claude Code. [English below ↓
 - **標題列**：❗ 在等你（橘色，有才顯示）、● 做完還沒打開（黃色，有才顯示）、⏳ 執行中、⏸ 可能在等你、✅ 最近一小時完成的數量。
 - **用量**：5h／7d 用量條與百分比（綠 < 50%、黃 50–79%、紅 ≥ 80%），以及距離重置的倒數；過了重置時間顯示「已重置」。只有 Claude 訂閱帳號才有這項資料（見[已知限制](#已知限制)）。
 - **兩種檢視**：預設是「只看執行中與用量」，只列在等你／執行中／可能在等你的工作階段，底下列出正在跑的工作（Claude 主回合、工具、Agent、背景指令、Workflow、監看），最後是做完但還沒打開的（每個一行，最多 4 個，其餘顯示「+N 個未讀」），最多 12 行。按標題列的 **◐** 切換成「全部工作階段」（最多 8 列，含剛完成、閒置、剛結束的）。
-- **右鍵選單**：顯示：全部工作階段／顯示：只看執行中與用量、音效、永遠置頂、透明度（100／90／80／70%）、重新整理、結束。在工作階段上按右鍵另外有「在 Claude 開啟」與「標為已讀」。
+- **右鍵選單**：顯示：全部工作階段／顯示：只看執行中與用量、音效、永遠置頂、透明度（100／90／80／70%）、重新整理、結束。在工作階段上按右鍵另外有「在 Claude 開啟」、「標為已讀」與「從清單移除」（只記在懸浮視窗的 `widget.json`；那個工作階段有新動作就重新出現，例如已在 app 刪掉、但紀錄檔還在的工作階段）。
 - **點一下開啟**：點一下工作階段（不拖曳）就在 Claude desktop app 打開它，見下方。
 - **收合**：按 **—** 或雙擊標題列，只留標題列與用量；收合時完成提示改閃整個標題列，有工作階段在等你時整個標題列持續橘色脈動。
 - **移動**：拖曳標題列，位置會記住；靠近螢幕底部時往上長，不會超出所在螢幕的工作區。
@@ -114,8 +114,8 @@ claude plugin update task-hud@claude-task-hud
 
 1. 用 `claude --version` 確認是 2.1.286 以上。
 2. 檢查安裝好的外掛資料夾，引擎拒絕載入時會列出原因（版本號換成你裝的版本）：
-   `claude plugin validate ~/.claude/plugins/cache/claude-task-hud/task-hud/0.6.0`
-   （Windows 的 cmd／PowerShell：`%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.6.0`）。也可以用 `claude --debug` 啟動，看記錄裡的 `task-hud`。
+   `claude plugin validate ~/.claude/plugins/cache/claude-task-hud/task-hud/0.6.1`
+   （Windows 的 cmd／PowerShell：`%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.6.1`）。也可以用 `claude --debug` 啟動，看記錄裡的 `task-hud`。
 3. 這個功能由 Claude Code 控制開關。可以在環境變數或 `~/.claude/settings.json` 的 `env` 裡設 `"CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1"` 強制開啟，再重新啟動 Claude Code。
 4. `--bare` 模式不會載入已安裝外掛的 hooks module；組織的 managed settings 設了 `allowManagedHooksOnly` 或 `disableAllHooks` 時也不會載入。
 
@@ -126,7 +126,7 @@ claude plugin update task-hud@claude-task-hud
 - **自動開啟**（Windows）：每個工作階段的第一個回合開始時，如果懸浮視窗沒開就自動開啟，不搶焦點。排程工作不會自動開啟；`claude -p`、SDK 等腳本啟動的工作階段也會自動開啟。
 - 按視窗右上角的 **×**（或右鍵「結束」）關閉後就不再自動開啟，之後用 `/task-float` 打開會恢復自動開啟。視窗剛出現或剛移動的 0.6 秒內按到 × 不算，免得游標底下突然冒出視窗時誤關；按下後移開再放開也會取消。
 - 建議用 `/task-float` 開啟。也可以直接執行安裝資料夾裡的程式（版本號換成你裝的版本）：
-  `pythonw "%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.6.0\widget\task_hud_widget.pyw"`
+  `pythonw "%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.6.1\widget\task_hud_widget.pyw"`
 - 懸浮視窗永遠置頂，會顯示每個工作階段的標題（第一個提示）。分享螢幕前可以先收合（**—**）或結束。
 
 ### 設定
@@ -239,7 +239,7 @@ python tools/screenshot.py docs/screenshot-all.png --mode all
 - **Header**: counts of ❗ needs you (orange, shown only when non-zero), ● finished but not opened yet (yellow, shown only when non-zero), ⏳ running, ⏸ maybe waiting and ✅ finished in the last hour.
 - **Usage**: 5h / 7d usage bars with percentages (green < 50%, yellow 50–79%, red ≥ 80%) and a countdown to the reset; once the reset time passes it shows 「已重置」 (reset). Only Claude subscription accounts have these figures (see [Known limitations](#known-limitations)).
 - **Two views**: the default, 「只看執行中與用量」 (running + usage only), lists only sessions that need you, are running or may be waiting, with the work running under each (Claude's turn, tools, agents, background shells, workflows, monitors), followed by sessions that finished but haven't been opened yet (one line each, at most 4, the rest summed up as 「+N 個未讀」 — N more unread), up to 12 lines. Click **◐** in the header to switch to 「全部工作階段」 (all sessions: up to 8 rows, including recently finished, idle and just-ended ones).
-- **Right-click menu**: view (all sessions / running + usage), sound, always on top, opacity (100/90/80/70%), refresh, quit. Right-clicking a session adds 「在 Claude 開啟」 (open in Claude) and 「標為已讀」 (mark as read).
+- **Right-click menu**: view (all sessions / running + usage), sound, always on top, opacity (100/90/80/70%), refresh, quit. Right-clicking a session adds 「在 Claude 開啟」 (open in Claude), 「標為已讀」 (mark as read) and 「從清單移除」 (remove from list: stored only in the window's `widget.json`; the session comes back when it does something new, handy for a session deleted in the app whose transcript is still on disk).
 - **Click to open**: click a session (without dragging) to open it in the Claude desktop app, see below.
 - **Collapse**: click **—** or double-click the header to keep only the header and usage; while collapsed, the completion alert flashes the whole header, and the whole header keeps pulsing orange while a session needs you.
 - **Move**: drag the header; the position is remembered, and the window grows upward near the bottom of a screen instead of running off it.
@@ -332,8 +332,8 @@ Then restart Claude Code. A floating window that is already open keeps running t
 
 1. Check `claude --version` is 2.1.286 or later.
 2. Validate the installed plugin folder; if the engine refuses the module, this says why (use the version you installed):
-   `claude plugin validate ~/.claude/plugins/cache/claude-task-hud/task-hud/0.6.0`
-   (Windows cmd / PowerShell: `%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.6.0`). You can also start `claude --debug` and look for `task-hud` in the log.
+   `claude plugin validate ~/.claude/plugins/cache/claude-task-hud/task-hud/0.6.1`
+   (Windows cmd / PowerShell: `%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.6.1`). You can also start `claude --debug` and look for `task-hud` in the log.
 3. Claude Code controls this feature with a switch. Set `"CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1"` in your environment or in the `env` block of `~/.claude/settings.json`, then restart Claude Code.
 4. `--bare` mode loads no hooks module from installed plugins, and neither do sessions whose managed (organization) settings set `allowManagedHooksOnly` or `disableAllHooks`.
 
@@ -344,7 +344,7 @@ Then restart Claude Code. A floating window that is already open keeps running t
 - **Auto-open** (Windows): when a session's first turn starts, the floating window opens if it isn't already, without stealing focus. Scheduled tasks never auto-open it; sessions started by scripts (`claude -p`, an SDK) do.
 - Closing it with **×** (or right-click → quit) turns auto-open off; opening it again with `/task-float` turns it back on. A press on × in the first 0.6 s after the window appears or moves is ignored, so a window popping up under the cursor is not closed by accident; pressing and then moving off before releasing cancels.
 - `/task-float` is the easiest way to open it. You can also run the installed copy directly (use the version you installed):
-  `pythonw "%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.6.0\widget\task_hud_widget.pyw"`
+  `pythonw "%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.6.1\widget\task_hud_widget.pyw"`
 - The window stays on top and shows every session's title (its first prompt). Collapse it (**—**) or quit it before sharing your screen.
 
 ### Configuration
