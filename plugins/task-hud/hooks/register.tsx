@@ -19,6 +19,7 @@ const FLASH_MS = 15_000 // 完成橫幅停留時間
 const TOAST_MS = 10_000 // 完成 toast 停留時間
 const KEEP_DONE_MS = 30 * 60_000 // 已完成項目在面板保留多久
 const KEEP_DONE_MAX = 30
+const KEEP_PERIOD_MAX = 64 // 還在忙的這段期間做完的子任務最多留幾筆（懸浮視窗的總進度用）
 const HEARTBEAT_MS = 15_000 // 懸浮視窗資料檔沒變化時，至少多久重寫一次
 const LAUNCH_TIMEOUT_MS = 10_000
 const PROBE_TIMEOUT_MS = 8_000 // 檢查一個 Python 啟動指令能不能用的時限
@@ -195,7 +196,7 @@ const BG_KINDS: readonly HudTaskKind[] = ['shell', 'workflow', 'monitor']
 
 type AllDone = { text: string; isError: boolean; durationMs: number }
 type Notice = { ids: string[]; toolUseId?: string; status?: string; summary?: string; event?: string }
-type Launch = { kind: HudTaskKind; taskId?: string; label?: string }
+type Launch = { kind: HudTaskKind; taskId?: string; label?: string; runDir?: string; scriptPath?: string }
 
 const workKey = (t: HudTask) => t.toolUseId ?? t.id
 const byEnd = (a: HudTask, b: HudTask) => (a.endedAt ?? 0) - (b.endedAt ?? 0)
@@ -284,7 +285,14 @@ function launchOf(tool: string, a: Record<string, unknown>, rec: Record<string, 
   }
   if (tool === 'Workflow') {
     const summary = s('summary') ?? text.match(/^Summary:[ \t]*(.+)$/m)?.[1]?.trim()
-    return { kind: 'workflow', taskId: s('taskId') ?? parseTaskId(text), label: summary ?? s('workflowName') }
+    // run 的資料夾（journal.jsonl 在裡面）與 script 檔：懸浮視窗靠它們算進度
+    return {
+      kind: 'workflow',
+      taskId: s('taskId') ?? parseTaskId(text),
+      label: summary ?? s('workflowName'),
+      runDir: s('transcriptDir'),
+      scriptPath: s('scriptPath'),
+    }
   }
   if (tool === 'Monitor') return { kind: 'monitor', taskId: s('taskId') ?? parseTaskId(text) }
   return undefined
@@ -415,12 +423,17 @@ async function quietly(fn: () => Promise<unknown>): Promise<void> {
   }
 }
 
-function prune(list: HudTask[], now: number): HudTask[] {
+function prune(list: HudTask[], now: number, since?: number): HudTask[] {
   const running = list.filter(isRunning)
-  const done = list
-    .filter(t => !isRunning(t) && now - (t.endedAt ?? now) < KEEP_DONE_MS)
-    .slice(-KEEP_DONE_MAX)
-  return [...running, ...done].sort((a, b) => a.startedAt - b.startedAt)
+  // 忙碌期還沒結束：這段期間做完的子任務（背景啟動的 agent、背景工作）不受 30 分鐘／30 筆限制，懸浮視窗的總進度要數它們
+  // （前景 agent 不是子任務：沒有 toolUseId，也不是從通知補建的 bg: 列）
+  const sub = (t: HudTask) => t.kind !== 'agent' || t.toolUseId !== undefined || t.id.startsWith('bg:')
+  const inPeriod = (t: HudTask) =>
+    since !== undefined && t.kind !== 'turn' && t.kind !== 'tool' && sub(t) && (t.endedAt ?? now) >= since
+  const ended = list.filter(t => !isRunning(t))
+  const done = ended.filter(t => !inPeriod(t) && now - (t.endedAt ?? now) < KEEP_DONE_MS).slice(-KEEP_DONE_MAX)
+  const period = ended.filter(inPeriod).slice(-KEEP_PERIOD_MAX)
+  return [...running, ...done, ...period].sort((a, b) => a.startedAt - b.startedAt)
 }
 
 type Change = { list: HudTask[]; done: HudTask[] }
@@ -439,11 +452,12 @@ function inOrder(fn: () => Promise<unknown>): Promise<void> {
 
 async function mutate($: EngineInterface, fn: (list: HudTask[]) => Change): Promise<HudTask[]> {
   const now = await $.clock.now()
+  const period = await read($, busy)
   let done: HudTask[] = []
   await update($, tasks, list => {
     const change = fn([...list])
     done = change.done
-    return prune(change.list, now)
+    return prune(change.list, now, period?.since)
   })
   await inOrder(() => checkAllDone($))
   return done
@@ -577,6 +591,7 @@ async function onNotification($: EngineInterface, text: string): Promise<void> {
       status,
       startedAt: at,
       endedAt: at,
+      ...(n.toolUseId !== undefined && { toolUseId: n.toolUseId }),
     }
     await inOrder(async () => {
       const cur = await read($, busy)
@@ -924,7 +939,8 @@ async function snapshot($: EngineInterface, sessionId: string, isEnded: boolean,
   const list = await read($, tasks)
   const name = await read($, title)
   // 靜置期間（全部停下但還沒滿 SETTLE_MS）仍算執行中，懸浮視窗不會先閃一下閒置
-  const running = list.some(isRunning) || (await read($, busy)) !== null
+  const period = await read($, busy)
+  const running = list.some(isRunning) || period !== null
   // 等你回覆優先於執行中／閒置；結束的 session 不再等任何人
   const waitingFor = isEnded ? null : await read($, attention)
   return {
@@ -936,6 +952,8 @@ async function snapshot($: EngineInterface, sessionId: string, isEnded: boolean,
     usage: await read($, usage),
     lastDone: await read($, lastDone),
     attention: waitingFor,
+    // 懸浮視窗算工作階段總進度用：這段忙碌期之後結束的工作才算；結束的 session 的忙碌期已作廢
+    busySince: isEnded || period === null ? null : period.since,
   }
 }
 
@@ -952,6 +970,7 @@ function fileText(c: Core, startedAt: number, now: number): string {
     usage: c.usage,
     lastDone: c.lastDone,
     attention: c.attention,
+    busySince: c.busySince ?? null,
   }
   return JSON.stringify(doc)
 }
@@ -1353,12 +1372,14 @@ export const register: Register = on => {
     try {
       if (e.tool === 'Agent') {
         // subagent 由 agent.list 追蹤；背景啟動的先在這裡建一列，標上 toolUseId 當成背景工作
+        // 沒寫 run_in_background 的 Agent 也可能在背景跑：看結果是不是 async_launched
         // return await：外層的 finally 要等呼叫真的結束才收掉等待
-        if (e.agentId !== undefined || a.run_in_background !== true) return await next(e)
+        if (e.agentId !== undefined) return await next(e)
         const ran = await next(e)
         await quietly(async () => {
           if (ran.deny !== undefined || ran.isError === true) return
           const rec = ran.result !== null && typeof ran.result === 'object' ? (ran.result as Record<string, unknown>) : {}
+          if (a.run_in_background !== true && rec.status !== 'async_launched' && rec.isAsync !== true) return
           const agentId = strOf(rec.agentId) || ran.text?.match(/agentId:\s*([A-Za-z0-9_-]+)/)?.[1]
           if (!agentId) return
           const id = `agent:${agentId}`
@@ -1412,7 +1433,16 @@ export const register: Register = on => {
             await mutate($, list => ({
               list: [
                 ...list.filter(t => t.id !== id && t.id !== bgId),
-                { id: bgId, kind: launch.kind, label: bgLabel, status: 'running', startedAt: at, toolUseId: e.tool_use_id },
+                {
+                  id: bgId,
+                  kind: launch.kind,
+                  label: bgLabel,
+                  status: 'running',
+                  startedAt: at,
+                  toolUseId: e.tool_use_id,
+                  ...(launch.runDir !== undefined && { runDir: launch.runDir }),
+                  ...(launch.scriptPath !== undefined && { scriptPath: launch.scriptPath }),
+                },
               ],
               done: [],
             }))

@@ -55,6 +55,14 @@ A floating, always-on-top task and usage HUD for Claude Code. [English below ↓
 
 **背景工作**——Workflow、背景 Bash（`run_in_background`）、背景 Agent、Monitor 還在跑時，即使 Claude 的回合已經結束，工作階段仍算「執行中」，直到它們真的結束（收到完成通知）才算完成。Artifact 的自動追蹤（發佈或讀過 Artifact 之後，Claude Code 會在背景持續接收它的留言與更新）整個工作階段都開著，不算在跑的工作。從 transcript 推斷時，15 分鐘沒動靜的背景工作會標成「N 分鐘無動靜」。
 
+**進度與預估剩餘時間**——只看執行中模式，在工作列的耗時左邊顯示：
+
+- **Workflow**：`階段 2/4 · 60% · 約剩 8 分`。分母是 script 開頭 `meta.phases` 宣告的階段數；每個階段各算「已結束的 agent ÷ 已開始的 agent」再加總（`pipeline()` 讓好幾個階段同時在跑時寫成「階段 2–4/4」；script 跳過的階段算做完）。預估時間是「已經跑了多久 × 剩下的比例」，每有一個 agent 結束就重算，中間每秒倒數；超過預估就只留百分比。沒有宣告 phases 的 script 只顯示 agent 的「已結束/已開始」。
+- **工作階段**：這段忙碌期有 2 個以上的子任務（背景 Agent、背景指令、Workflow、監看；不算回合、前景工具與前景 Agent）時，工作階段那一列顯示完成數，例如 `2/5`；所有在跑的子任務都有預估、主回合也沒在跑時，再加上最久的那個預估。「全部工作階段」畫面也在時間欄前面顯示這段文字。
+- **背景指令、Agent、一般回合**沒有總量可以算，只顯示耗時，不顯示猜出來的數字。
+- **展開**：可以展開的列最左邊有 **▸**，點箭頭展開（變成 **▾**），再點一次收合；點列的其他地方照舊在 Claude 開啟。工作階段展開後列出這段忙碌期的全部子任務（做完的變暗、打勾，時間是花了多久）；Workflow 展開後列出每個 agent（● 執行中、✓ 完成、✗ 失敗；有多個階段時前面加階段名），最多 15 行，其餘併成「+N 個已完成」。畫面上有展開的列時，只看執行中模式最多 30 行。展開狀態記在 `widget.json`。
+- **預估只是粗估**：用 76 個做完的 workflow 回測，只有大約一半落在實際時間的 2 倍以內，所以寫「約剩」。
+
 **沒裝外掛的工作階段**——沒有外掛資料（或資料超過 45 秒沒更新）的工作階段，會從 `~/.claude/projects` 的 transcript 唯讀推斷狀態（只看最近 6 小時有活動的）。
 
 **Claude Code 內**：
@@ -106,8 +114,8 @@ claude plugin update task-hud@claude-task-hud
 
 1. 用 `claude --version` 確認是 2.1.286 以上。
 2. 檢查安裝好的外掛資料夾，引擎拒絕載入時會列出原因（版本號換成你裝的版本）：
-   `claude plugin validate ~/.claude/plugins/cache/claude-task-hud/task-hud/0.5.3`
-   （Windows 的 cmd／PowerShell：`%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.5.3`）。也可以用 `claude --debug` 啟動，看記錄裡的 `task-hud`。
+   `claude plugin validate ~/.claude/plugins/cache/claude-task-hud/task-hud/0.6.0`
+   （Windows 的 cmd／PowerShell：`%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.6.0`）。也可以用 `claude --debug` 啟動，看記錄裡的 `task-hud`。
 3. 這個功能由 Claude Code 控制開關。可以在環境變數或 `~/.claude/settings.json` 的 `env` 裡設 `"CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1"` 強制開啟，再重新啟動 Claude Code。
 4. `--bare` 模式不會載入已安裝外掛的 hooks module；組織的 managed settings 設了 `allowManagedHooksOnly` 或 `disableAllHooks` 時也不會載入。
 
@@ -118,7 +126,7 @@ claude plugin update task-hud@claude-task-hud
 - **自動開啟**（Windows）：每個工作階段的第一個回合開始時，如果懸浮視窗沒開就自動開啟，不搶焦點。排程工作不會自動開啟；`claude -p`、SDK 等腳本啟動的工作階段也會自動開啟。
 - 按視窗右上角的 **×**（或右鍵「結束」）關閉後就不再自動開啟，之後用 `/task-float` 打開會恢復自動開啟。視窗剛出現或剛移動的 0.6 秒內按到 × 不算，免得游標底下突然冒出視窗時誤關；按下後移開再放開也會取消。
 - 建議用 `/task-float` 開啟。也可以直接執行安裝資料夾裡的程式（版本號換成你裝的版本）：
-  `pythonw "%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.5.3\widget\task_hud_widget.pyw"`
+  `pythonw "%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.6.0\widget\task_hud_widget.pyw"`
 - 懸浮視窗永遠置頂，會顯示每個工作階段的標題（第一個提示）。分享螢幕前可以先收合（**—**）或結束。
 
 ### 設定
@@ -135,6 +143,7 @@ claude plugin update task-hud@claude-task-hud
 | `collapsed` | `false` | 收合。 |
 | `x`, `y` | 自動 | 視窗位置。刪掉就回到主螢幕右上角。 |
 | `readMarks` | 無 | 右鍵「標為已讀」的工作階段：`{session id: 那次完成的時間（毫秒）}`。最多 200 個；那個工作階段再做完一次、又開始工作或 7 天後自動刪掉。沒有標記時不寫這個 key。 |
+| `expanded` | 無 | 只看執行中模式裡展開中的列：工作階段是 session id，Workflow 是 `session id/run:<runId>`。最多 200 個；工作階段從清單消失時自動刪掉。沒有展開時不寫這個 key。 |
 
 更新頻率、只看最近幾小時等常數在 `task_hud_widget.pyw` 開頭的「可調整的設定」。
 
@@ -143,7 +152,7 @@ claude plugin update task-hud@claude-task-hud
 ### 資料與隱私
 
 - **全部在本機，沒有任何網路連線。** 懸浮視窗只在 `127.0.0.1:47391` 開一個連接埠，用來確保只有一個視窗。點一下開啟只是請 Windows 開 `claude://` 連結，由 desktop app 處理。
-- 外掛寫入 `~/.claude/task-hud/sessions/<sessionId>.json`：工作階段標題（第一個提示的前 80 個字）、工作目錄、工作清單、用量，以及在等你時的說明（例如 `AskUserQuestion` 的第一個問題、要核准的工具標籤、回合最後那句問句的前 60 個字）。工作清單含工具標籤，例如指令的說明（沒有說明時是指令的前 60 個字）、檔名、網址、搜尋字串、Grep 樣式；這些本來就記在 transcript 裡。內容有變才寫，沒變每 15 秒寫一次當心跳。只有 Windows 會寫這個檔（只有懸浮視窗會讀它）。
+- 外掛寫入 `~/.claude/task-hud/sessions/<sessionId>.json`：工作階段標題（第一個提示的前 80 個字）、工作目錄、工作清單（Workflow 另含它的執行資料夾與 script 路徑）、這段忙碌期的開始時間、用量，以及在等你時的說明（例如 `AskUserQuestion` 的第一個問題、要核准的工具標籤、回合最後那句問句的前 60 個字）。工作清單含工具標籤，例如指令的說明（沒有說明時是指令的前 60 個字）、檔名、網址、搜尋字串、Grep 樣式；這些本來就記在 transcript 裡。內容有變才寫，沒變每 15 秒寫一次當心跳。只有 Windows 會寫這個檔（只有懸浮視窗會讀它）。
 - 外掛只在有權限確認對話框開著時，讀 `~/.claude/sessions/*.json` 找出這個工作階段自己的行程登記（最多讀最近改過的 20 個檔），看你是不是已經回應；其他時候不讀，也從不寫入。
 - 懸浮視窗**唯讀**（從不寫入或修改這些檔案）：
   - `~/.claude/projects/**/*.jsonl`：最近 6 小時有更新的 transcript。判斷狀態通常只讀檔尾（包含回合最後一段文字，用來判斷是不是問句）；找不到標題時會掃描 30 MB 以下的整個檔案；偵測背景工作時，第一次最多讀每個檔案的最後 64 MB，之後只讀新增的部分。
@@ -153,6 +162,7 @@ claude plugin update task-hud@claude-task-hud
     - `Local Storage\leveldb` 裡的**一個** key：`epitaxy-unread-v1`（側邊欄的未讀清單，也就是黃點）。只找這個 key，Local Storage 的其他內容不解讀；檔案沒變不重讀，最多每 3 秒看一次。
     - 用允許 app 同時寫入、改名、刪除的方式開檔，讀進記憶體就關掉，不會擋到 app；鎖住、截斷或壞掉的檔案略過。絕不寫入、鎖住或修改 app 的任何檔案。
   - 修改時間：transcript 旁的 `subagents` 資料夾，以及背景工作的輸出檔（暫存資料夾裡的，或 transcript 裡寫到的路徑）。
+  - Workflow 的執行資料夾（transcript 旁的 `<session>/subagents/workflows/<runId>/`）：`journal.jsonl`（只讀新增的部分）、每個 agent 檔的修改時間，以及 `agent-<id>.meta.json` 的說明；還有 Workflow 的 script（只讀前 64 KB，取出 `meta.phases` 的階段名稱）。只在那個 Workflow 還在跑時讀。
 - 懸浮視窗寫入：`~/.claude/task-hud/widget.json`（設定，包含「標為已讀」）、`~/.claude/task-hud/widget.log`（錯誤記錄，以及視窗啟動與被你關閉的時間，上限約 200 KB）。
 - 自動清理：懸浮視窗開著時，每 10 分鐘刪除 `~/.claude/task-hud/sessions/` 裡已結束超過 24 小時、或 3 天沒更新的檔案。視窗關著時不會清理，下次開啟時才補清。不會修改或刪除任何 transcript。
 
@@ -177,7 +187,8 @@ claude plugin marketplace remove claude-task-hud
 - **沒裝外掛、而且 Claude Code 沒寫行程登記的狀態（舊版）時**：偵測不到權限確認；從 transcript 推斷的「在等你」也無法確認工作階段還開著，最多只標示 1 小時。
 - 外掛 hooks API 是 early access，Claude Code 更新後可能需要跟著更新外掛。
 - 外掛在工作階段中途才載入時，載入前就在跑的背景工作要等完成通知才會出現。
-- 只顯示最近 6 小時有活動的工作階段；全部模式最多 8 列，只看執行中模式最多 12 行（其中做完還沒打開的最多 4 個）。
+- 只顯示最近 6 小時有活動的工作階段；全部模式最多 8 列，只看執行中模式最多 12 行（其中做完還沒打開的最多 4 個；畫面上有展開的列時最多 30 行）。
+- **進度百分比只有 Workflow 有**，而且要 script 宣告了 `meta.phases`（舊版 Claude Code 的 journal 沒有階段資訊時只顯示 agent 數）；agent 總數要跑了才知道，所以新的 agent 開始時百分比可能往回掉。預估剩餘時間只是粗估。
 - **黃點需要 Claude desktop app**，只用 CLI 的工作階段沒有黃點。它讀的是 app 內部、沒有公開的資料格式：app 更新改了格式時，黃點會改用推斷（`lastFocusedAt`）或消失，其他功能不受影響。「標為已讀」只影響懸浮視窗，不會清掉 app 側邊欄的黃點。
 
 ### 運作方式
@@ -260,6 +271,14 @@ python tools/screenshot.py docs/screenshot-all.png --mode all
 
 **Background work** — while a Workflow, background Bash (`run_in_background`), background Agent or Monitor is still running, the session stays "running" even after Claude's turn has ended, and only counts as done once that work really finishes (its completion notification arrives). An artifact watch (after Claude publishes or reads an Artifact, Claude Code keeps receiving its comments and updates in the background for the rest of the session) is not counted as running work. When inferred from a transcript, background work that has been silent for 15 minutes is marked 「N 分鐘無動靜」 (no activity for N minutes).
 
+**Progress and estimated time left** — in the running view, shown to the left of a task's elapsed time:
+
+- **Workflows**: `階段 2/4 · 60% · 約剩 8 分` (phase 2 of 4 · 60% · about 8 min left). The denominator is the number of phases the script declares in `meta.phases`; each phase contributes "finished agents ÷ started agents" (when `pipeline()` runs several phases at once it reads 「階段 2–4/4」; phases the script skipped count as done). The estimate is "time so far × the share left", recomputed whenever an agent finishes and counting down every second in between; once it is overdue only the percentage stays. Scripts without `meta.phases` show finished/started agents only.
+- **Sessions**: when the current busy period has 2 or more sub-tasks (background agents, background shells, workflows, monitors; turns, foreground tools and foreground agents don't count), the session row shows how many are done, e.g. `2/5`; when every running sub-task has an estimate and the main turn isn't running, the longest estimate is added. The all-sessions view shows the same text in front of the time.
+- **Background shells, agents and plain turns** have nothing to measure against, so they only show elapsed time — no guessed numbers.
+- **Expanding**: rows that can expand get a **▸** at the far left; click the arrow to expand (it becomes **▾**) and again to collapse; clicking anywhere else on the row still opens it in Claude. An expanded session lists every sub-task of the busy period (finished ones dimmed, with a check mark and how long they took); an expanded workflow lists each agent (● running, ✓ done, ✗ failed; prefixed with the phase when there are several), up to 15 lines, the rest summed up as 「+N 個已完成」 (N more finished). While an expanded row is on screen the running view allows up to 30 lines. What's expanded is remembered in `widget.json`.
+- **Estimates are rough**: backtested on 76 finished workflows, only about half landed within 2× of the actual time, hence 「約剩」 ("about … left").
+
 **Sessions without the plugin** — sessions with no plugin data (or data older than 45 s) are inferred read-only from their transcripts in `~/.claude/projects` (only those active in the last 6 hours).
 
 **Inside Claude Code**:
@@ -313,8 +332,8 @@ Then restart Claude Code. A floating window that is already open keeps running t
 
 1. Check `claude --version` is 2.1.286 or later.
 2. Validate the installed plugin folder; if the engine refuses the module, this says why (use the version you installed):
-   `claude plugin validate ~/.claude/plugins/cache/claude-task-hud/task-hud/0.5.3`
-   (Windows cmd / PowerShell: `%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.5.3`). You can also start `claude --debug` and look for `task-hud` in the log.
+   `claude plugin validate ~/.claude/plugins/cache/claude-task-hud/task-hud/0.6.0`
+   (Windows cmd / PowerShell: `%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.6.0`). You can also start `claude --debug` and look for `task-hud` in the log.
 3. Claude Code controls this feature with a switch. Set `"CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1"` in your environment or in the `env` block of `~/.claude/settings.json`, then restart Claude Code.
 4. `--bare` mode loads no hooks module from installed plugins, and neither do sessions whose managed (organization) settings set `allowManagedHooksOnly` or `disableAllHooks`.
 
@@ -325,7 +344,7 @@ Then restart Claude Code. A floating window that is already open keeps running t
 - **Auto-open** (Windows): when a session's first turn starts, the floating window opens if it isn't already, without stealing focus. Scheduled tasks never auto-open it; sessions started by scripts (`claude -p`, an SDK) do.
 - Closing it with **×** (or right-click → quit) turns auto-open off; opening it again with `/task-float` turns it back on. A press on × in the first 0.6 s after the window appears or moves is ignored, so a window popping up under the cursor is not closed by accident; pressing and then moving off before releasing cancels.
 - `/task-float` is the easiest way to open it. You can also run the installed copy directly (use the version you installed):
-  `pythonw "%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.5.3\widget\task_hud_widget.pyw"`
+  `pythonw "%USERPROFILE%\.claude\plugins\cache\claude-task-hud\task-hud\0.6.0\widget\task_hud_widget.pyw"`
 - The window stays on top and shows every session's title (its first prompt). Collapse it (**—**) or quit it before sharing your screen.
 
 ### Configuration
@@ -342,6 +361,7 @@ The window keeps its settings in `~/.claude/task-hud/widget.json` (Windows: `%US
 | `collapsed` | `false` | Collapsed. |
 | `x`, `y` | auto | Window position. Delete them to go back to the top-right of the primary screen. |
 | `readMarks` | none | Sessions you marked as read from the right-click menu: `{session id: the finish time that was marked (ms)}`. At most 200; an entry is removed when that session finishes again, starts working again, or after 7 days. The key isn't written while empty. |
+| `expanded` | none | Rows expanded in the running view: a session id for a session, `session id/run:<runId>` for a workflow. At most 200; entries are removed once their session leaves the list. The key isn't written while empty. |
 
 Refresh rate, the 6-hour window and other constants are at the top of `task_hud_widget.pyw` (「可調整的設定」).
 
@@ -350,7 +370,7 @@ If you set `CLAUDE_CONFIG_DIR`, read that folder wherever this document says `~/
 ### Data & privacy
 
 - **Everything stays on your machine; nothing touches the network.** The window only opens a port on `127.0.0.1:47391` to keep a single instance. Click-to-open just asks Windows to open a `claude://` link, which the desktop app handles.
-- The plugin writes `~/.claude/task-hud/sessions/<sessionId>.json`: the session title (first 80 characters of the first prompt), working directory, task list, usage and, while Claude needs you, what it is waiting for (e.g. the first `AskUserQuestion` question, the label of the tool to approve, or the first 60 characters of the question that ended the turn). The task list carries tool labels such as a command's description (or its first 60 characters when it has none), file names, URLs, search queries and Grep patterns, all of which are already in the transcript. It writes when something changes, and every 15 s as a heartbeat otherwise. Only Windows writes this file (only the window reads it).
+- The plugin writes `~/.claude/task-hud/sessions/<sessionId>.json`: the session title (first 80 characters of the first prompt), working directory, task list (for a workflow also its run folder and script path), when the current busy period started, usage and, while Claude needs you, what it is waiting for (e.g. the first `AskUserQuestion` question, the label of the tool to approve, or the first 60 characters of the question that ended the turn). The task list carries tool labels such as a command's description (or its first 60 characters when it has none), file names, URLs, search queries and Grep patterns, all of which are already in the transcript. It writes when something changes, and every 15 s as a heartbeat otherwise. Only Windows writes this file (only the window reads it).
 - The plugin reads `~/.claude/sessions/*.json` only while a permission prompt is open, to find this session's own registry entry (reading at most the 20 most recently changed files) and see whether you have answered; it never reads them otherwise and never writes them.
 - The window **reads only** (it never writes or modifies any of these files):
   - `~/.claude/projects/**/*.jsonl`: transcripts updated in the last 6 hours. Status usually comes from the tail; a file under 30 MB may be scanned whole to find its title; to detect background work, the first pass reads up to the last 64 MB of each file and later passes only what was appended.
@@ -360,6 +380,7 @@ If you set `CLAUDE_CONFIG_DIR`, read that folder wherever this document says `~/
     - **One** key in `Local Storage\leveldb`: `epitaxy-unread-v1` (the sidebar's unread list, i.e. the yellow dots). Only that key is looked up; nothing else in Local Storage is interpreted. Unchanged files aren't re-read, and it is checked at most every 3 s.
     - Files are opened in a mode that lets the app keep writing, renaming and deleting them, read into memory and closed at once, so the app is never blocked; locked, truncated or corrupt files are skipped. The window never writes, locks or modifies any of the app's files.
   - Modification times of the `subagents` folder beside a transcript and of background-task output files (in the temp folder, or at paths the transcript names).
+  - A workflow's run folder (`<session>/subagents/workflows/<runId>/` beside the transcript): `journal.jsonl` (only the newly appended part), the modification times of each agent's files and the description in `agent-<id>.meta.json`; plus the workflow script (only its first 64 KB, for the phase names in `meta.phases`). Read only while that workflow is running.
 - The window writes `~/.claude/task-hud/widget.json` (settings, including mark as read) and `~/.claude/task-hud/widget.log` (errors, plus when the window started and when you closed it, capped at about 200 KB).
 - Cleanup: while the window is open, every 10 minutes it deletes files in `~/.claude/task-hud/sessions/` that ended more than 24 hours ago or haven't been updated for 3 days. Nothing is cleaned while the window is closed; it catches up the next time it opens. It never modifies or deletes a transcript.
 
@@ -384,7 +405,8 @@ Finally you can delete the `~/.claude/task-hud` folder (settings, log and sessio
 - **Without the plugin and without the process-registry status (older Claude Code)**: permission prompts can't be detected, and a needs-you state inferred from a transcript can't be confirmed as still open, so it is shown for at most 1 hour.
 - The plugin hooks API is early access; a Claude Code update may require a plugin update.
 - When the plugin loads in the middle of a session, background work started before it loaded only shows up when its completion notification arrives.
-- Only sessions active in the last 6 hours are shown; at most 8 rows in the all-sessions view and 12 lines in the running view (at most 4 of them for finished-but-unopened sessions).
+- Only sessions active in the last 6 hours are shown; at most 8 rows in the all-sessions view and 12 lines in the running view (at most 4 of them for finished-but-unopened sessions; up to 30 while an expanded row is on screen).
+- **Only workflows get a progress percentage**, and only when the script declares `meta.phases` (journals from older Claude Code versions without phase info show agent counts only); the total number of agents is only known as they start, so the percentage can drop when new agents begin. Time-left estimates are rough.
 - **Yellow dots need the Claude desktop app**; CLI-only sessions never get one. They come from the app's internal, undocumented data format: if an app update changes it, the dots fall back to the heuristic (`lastFocusedAt`) or disappear, and nothing else is affected. Mark as read only affects the floating window; it doesn't clear the dot in the app's sidebar.
 
 ### How it works

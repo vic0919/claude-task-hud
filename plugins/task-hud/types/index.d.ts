@@ -12,6 +12,10 @@ export type HudTask = {
   detail?: string
   /** The tool call that started a background task */
   toolUseId?: string
+  /** Workflow only: the run's folder (the launch result's transcriptDir), where journal.jsonl and the agent transcripts are */
+  runDir?: string
+  /** Workflow only: the run's script (the launch result's scriptPath; an inline script is saved to a file too) */
+  scriptPath?: string
 }
 
 export type HudLimit = { pct: number; resetsAt?: string }
@@ -99,6 +103,11 @@ export type HudSessionFile = {
   lastDone: HudFlash | null
   /** Set while Claude waits for the person (state is then 'waiting'); null otherwise and once ended */
   attention: HudAttention | null
+  /**
+   * Start of the open busy period (the state's busy.since, kept through the settle window); null while idle
+   * and once ended. Absent in files written by versions before 0.6.0
+   */
+  busySince?: number | null
 }
 
 declare module 'claude-code' {

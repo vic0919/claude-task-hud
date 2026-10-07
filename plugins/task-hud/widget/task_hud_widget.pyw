@@ -74,7 +74,13 @@ FLASH_S = 12
 DONE_WINDOW_MS = 3600_000
 MAX_ROWS = 8
 RUN_LINES = 12  # 只看執行中模式最多幾行
+EXPAND_LINES = 30  # 有展開的工作階段或 workflow 時，只看執行中模式最多幾行
 RUN_TASKS = 4  # 每個工作階段最多列幾個工作
+WF_AGENT_LINES = 15  # workflow 展開時最多列幾行 agent（其餘併成「+N 個已完成」）
+EXPANDED_MAX = 200  # 展開狀態最多記幾個
+BUSY_GAP_MS = 2_500  # 推算忙碌期時容許的空檔（和 mod 的靜置時間一樣）
+BG_DONE_MAX = 64  # transcript 來源：記住最近結束的幾個背景工作（算工作階段的總進度）
+SCRIPT_HEAD = 64 * 1024  # Workflow script 只讀開頭這麼多（meta 宣告在最前面）
 UNREAD_LINES = 4  # 只看執行中模式最多列幾個做完還沒打開的（其餘併成「+N 個未讀」）
 QUIET_MS = 10_000  # 忙不到這麼久就完成：只閃不叫
 BG_LIVE_MS = 15 * 60_000  # 背景工作這麼久沒動靜 → 可能已經死掉
@@ -286,6 +292,18 @@ def fmt_until(iso_s, now: float) -> str:
     return f'{h // 24}d{h % 24}h'
 
 
+def fmt_eta(ms: float) -> str:
+    """預估剩餘時間（只是粗估，一律標「約剩」）：不到 1 分鐘「約剩 <1 分」；否則分鐘無條件進位，
+    不到 60 分「約剩 N 分」，其他「約剩 H 小時 M 分」（M 為 0 時省略）。"""
+    if ms < 60_000:
+        return '約剩 <1 分'
+    m = int(-(-ms // 60_000))
+    if m < 60:
+        return f'約剩 {m} 分'
+    h, m = divmod(m, 60)
+    return f'約剩 {h} 小時 {m} 分' if m else f'約剩 {h} 小時'
+
+
 def pct_color(p: float) -> str:
     return RED if p >= 80 else YELLOW if p >= 50 else GREEN
 
@@ -348,11 +366,12 @@ def load_config(path: str) -> dict:
         v = num(cfg.get(k))
         cfg[k] = int(v) if v is not None else None
     cfg['readMarks'] = clean_marks(cfg.get('readMarks'))
+    cfg['expanded'] = clean_expanded(cfg.get('expanded'))
     return cfg
 
 
 def save_config(path: str, cfg: dict) -> None:
-    out = {k: v for k, v in cfg.items() if not (k in ('x', 'y') and v is None) and not (k == 'readMarks' and not v)}
+    out = {k: v for k, v in cfg.items() if not (k in ('x', 'y') and v is None) and not (k in ('readMarks', 'expanded') and not v)}
     try:
         write_json(path, out)
     except OSError:
@@ -413,6 +432,25 @@ def prune_marks(marks: dict, sessions, now: int) -> bool:
     for sid in drop:
         del marks[sid]
     return bool(drop)
+
+
+# ---------- 展開狀態（只看執行中模式的 ▸／▾） ----------
+
+def clean_expanded(v) -> list:
+    """widget.json 的 expanded：展開中的工作階段（sid）與 workflow（sid/run:<runId>）；格式不對的丟掉。"""
+    if not isinstance(v, list):
+        return []
+    return list(dict.fromkeys(k for k in v if isinstance(k, str) and k))[-EXPANDED_MAX:]
+
+
+def prune_expanded(keys: list, sessions) -> bool:
+    """工作階段已經不在清單裡：它和它底下 workflow 的展開狀態一起清掉（比照 readMarks）。有變動回傳 True。"""
+    alive = {s.get('sid') for s in sessions}
+    keep = [k for k in keys if k.split('/', 1)[0] in alive]
+    if len(keep) == len(keys):
+        return False
+    keys[:] = keep
+    return True
 
 
 # ---------- transcript 推斷 ----------
@@ -816,6 +854,8 @@ class BgScan:
         self.stops: dict[str, str] = {}  # TaskStop 的 tool_use id → 要停的 task id
         self.maybe: dict[str, dict] = {}  # 還沒有結果的 Bash／Agent 呼叫：逾時或非同步時會變成背景工作
         self.closed: dict[str, None] = {}  # 已結束的 tool_use id / task id（結果比通知晚到時用）
+        self.done: list[dict] = []  # 最近結束的背景工作 {id, kind, label, start, end}（最多 BG_DONE_MAX 個，算總進度用）
+        self.at: int | None = None  # 正在處理的那筆紀錄的時間（背景工作的結束時間）
         self.notif_at: int | None = None  # 最後一次背景通知排進佇列的時間
         self.q_last: tuple | None = None  # 最後一筆佇列操作：(operation, 時間, 是不是背景通知)
         self.capped = False
@@ -916,6 +956,7 @@ class BgScan:
             return
         if not isinstance(rec, dict):
             return
+        self.at = parse_ts(rec.get('timestamp')) or self.at
         typ = rec.get('type')
         if typ == 'queue-operation':
             c = rec.get('content')
@@ -956,8 +997,10 @@ class BgScan:
                         if kind == 'monitor' and ts and inp.get('persistent') is not True:
                             until = ts + (num(inp.get('timeout_ms')) or 30 * 60_000) + 60_000  # 到期後一分鐘還沒通知就不算活著
                         run = inp.get('resumeFromRunId') if isinstance(inp.get('resumeFromRunId'), str) else None
+                        script = inp['scriptPath'] if kind == 'workflow' and isinstance(inp.get('scriptPath'), str) and inp['scriptPath'] else None
                         self.launches[b['id']] = {'id': b['id'], 'kind': kind, 'label': launch_label(name, kind, inp),
-                                                  'start': ts, 'tid': None, 'result': False, 'hints': [], 'until': until, 'run': run}
+                                                  'start': ts, 'tid': None, 'result': False, 'hints': [], 'until': until, 'run': run,
+                                                  'script': script}
                 elif name in _STOP_TOOLS:
                     tid = next((inp[k] for k in ('task_id', 'shell_id', 'bash_id') if isinstance(inp.get(k), str) and inp[k]), None)
                     if tid:
@@ -965,7 +1008,7 @@ class BgScan:
                 elif name in _MAYBE_BG and own and b['id'] not in self.closed:
                     k = _MAYBE_BG[name]
                     self.maybe[b['id']] = {'id': b['id'], 'kind': k, 'label': launch_label(name, k, inp), 'start': ts,
-                                           'tid': None, 'result': False, 'hints': [], 'until': None, 'run': None}
+                                           'tid': None, 'result': False, 'hints': [], 'until': None, 'run': None, 'script': None}
                     if len(self.maybe) > 64:
                         del self.maybe[next(iter(self.maybe))]
             return
@@ -1019,7 +1062,7 @@ class BgScan:
         L = self.launches[tu]
         L['result'] = True
         if block.get('is_error') is True:
-            self._close(tu)
+            self._close(tu, finished=False)
             return
         text = '\n'.join(text_blocks(block.get('content')))
         tur = tur if isinstance(tur, dict) else {}
@@ -1031,7 +1074,7 @@ class BgScan:
                     tid = m.group(1)
                     break
         if tid is None and not _STARTED_RE.search(text):
-            self._close(tu)  # 沒有進背景，已經直接跑完
+            self._close(tu, finished=False)  # 沒有進背景，已經直接跑完
             return
         summ = tur.get('summary') if isinstance(tur.get('summary'), str) else None
         if summ is None:
@@ -1056,10 +1099,12 @@ class BgScan:
                 run = base_name(tur['transcriptDir']) or None
             run = run or L.get('run')
             if run:
-                # 同一個 run 被 resumeFromRunId 接續：先前那個工作已經不在跑了
+                # 同一個 run 被 resumeFromRunId 接續：先前那個工作已經不在跑了（同一個 run 接著跑，不算做完一個）
                 for other in [k for k, o in self.launches.items() if k != tu and o.get('run') == run]:
-                    self._close(other)
+                    self._close(other, finished=False)
                 L['run'] = run
+            if isinstance(tur.get('scriptPath'), str) and tur['scriptPath']:
+                L['script'] = tur['scriptPath']  # 算進度用：script 開頭的 meta.phases（inline script 也會存成檔）
         if tid:
             L['tid'] = tid
             self.tids[tid] = tu
@@ -1087,10 +1132,14 @@ class BgScan:
             self._close(tu)
         self._mark(tid)
 
-    def _close(self, tu: str) -> None:
+    def _close(self, tu: str, finished: bool = True) -> None:
+        """工作結束；finished：真的做完（通知、TaskStop），記進完成清單。啟動失敗、沒進背景、被同一個 run 接續的不記。"""
         L = self.launches.pop(tu, None)
         if L is not None and L['tid']:
             self.tids.pop(L['tid'], None)
+        if L is not None and finished:
+            self.done.append({'id': tu, 'kind': L['kind'], 'label': L['label'], 'start': L['start'], 'end': self.at or L['start']})
+            del self.done[:-BG_DONE_MAX]
         self.maybe.pop(tu, None)
         self._mark(tu)
 
@@ -1165,6 +1214,322 @@ def bg_summary(opened: list[dict]) -> str:
         return labels[0]
     joined = ' · '.join(labels)
     return joined if labels and len(opened) == len(labels) and len(joined) <= 40 else f'{len(opened)} 個工作'
+
+
+# ---------- 進度與預估剩餘時間 ----------
+#
+# 只有 Workflow 有分母：script 開頭的 export const meta = {..., phases: [{ title }, ...]} 宣告了全部階段，
+# <run 資料夾>/journal.jsonl 在執行中逐筆寫 launched／started{key, agentId, label?, phase?}／result／failed（沒有時間戳）；
+# agent 的開始時間用同資料夾 agent-<id>.meta.json 的 mtime，結束時間用 agent-<id>.jsonl 的 mtime。
+# 背景指令、Agent、監看、回合沒有總量：只顯示耗時，不顯示猜出來的數字。
+# 讀檔都在 Collector 的背景執行緒（依 mtime／讀到的位置快取），繪製只讀算好的結果。
+
+_META_START = re.compile(r'export\s+const\s+meta\s*=\s*\{')
+_JS_WORD = re.compile(r'[\w$]+')
+
+
+def _js_tokens(text: str, pos: int):
+    """從 pos 開始切 JavaScript 記號：('s', 字串內容)、('w', 識別字)、('p', 標點)；略過空白與註解。字串沒有結尾就停。"""
+    n = len(text)
+    while pos < n:
+        ch = text[pos]
+        if ch.isspace():
+            pos += 1
+        elif text.startswith('//', pos):
+            nl = text.find('\n', pos)
+            pos = n if nl < 0 else nl + 1
+        elif text.startswith('/*', pos):
+            end = text.find('*/', pos + 2)
+            if end < 0:
+                return
+            pos = end + 2
+        elif ch in '\'"`':
+            i, buf = pos + 1, []
+            while i < n and text[i] != ch:
+                if text[i] == '\\' and i + 1 < n:
+                    i += 1
+                buf.append(text[i])
+                i += 1
+            if i >= n:
+                return
+            yield 's', ''.join(buf)
+            pos = i + 1
+        elif ch.isalnum() or ch in '_$':
+            m = _JS_WORD.match(text, pos)
+            yield 'w', m.group()
+            pos = m.end()
+        else:
+            yield 'p', ch
+            pos += 1
+
+
+def parse_phases(text) -> list[str] | None:
+    """Workflow script 的 meta.phases：從 export const meta = { 用括號配對（略過字串與註解）取出整個 meta，
+    回傳 phases 陣列裡每個 { title: '…' } 的 title（單引號、雙引號、反引號都可以）。
+    沒有 meta、meta 沒有結尾、沒有 phases、phases 是空的，或有一項的 title 不是字串：回傳 None。"""
+    m = _META_START.search(text) if isinstance(text, str) else None
+    if m is None:
+        return None
+    toks, depth = [], 0
+    for tok in _js_tokens(text, m.end() - 1):
+        toks.append(tok)
+        if tok[0] == 'p' and tok[1] in '{[(':
+            depth += 1
+        elif tok[0] == 'p' and tok[1] in '}])':
+            depth -= 1
+            if depth == 0:
+                break
+    else:
+        return None  # meta 沒有結尾（壞掉或被截斷的 script）
+    titles: list[str] = []
+    objs, depth, arr = 0, 0, None  # arr：phases 陣列裡面的深度
+    for i, (k, v) in enumerate(toks):
+        if k == 'p' and v in '{[(':
+            depth += 1
+            if arr is None and v == '[' and depth == 2 and i >= 2 and toks[i - 1] == ('p', ':') and toks[i - 2] in (('w', 'phases'), ('s', 'phases')):
+                arr = depth
+            elif arr is not None and v == '{' and depth == arr + 1:
+                objs += 1
+        elif k == 'p' and v in '}])':
+            if arr is not None and depth == arr:
+                break  # phases 陣列結束
+            depth -= 1
+        elif (arr is not None and depth == arr + 1 and k in ('w', 's') and v == 'title' and i + 2 < len(toks)
+              and toks[i + 1] == ('p', ':') and toks[i + 2][0] == 's'):
+            titles.append(squash(toks[i + 2][1]))
+    if arr is None or objs == 0 or len(titles) != objs:
+        return None
+    return titles
+
+
+class WfJournal:
+    """一個 workflow run 的 journal.jsonl（只會往後追加）：記住讀到的位置，只讀新增的完整行；檔案變小就從頭重讀。
+    agents：key → {agentId, label, phase, status（running／done／failed／abandoned）, start, end}。
+    resume 沿用同一份 journal：同一個 key 重新開始就覆寫；launched（新的一次嘗試）把還在跑的標成放棄、之後不計入。
+    實際上 resume 不一定會再寫 launched，所以 workflow_progress 另外依開始時間排除前一次沒做完的。"""
+
+    def __init__(self):
+        self.ver = 0  # 內容（含 agent 時間）每變一次加一，從頭重讀也只增不減：進度結果依它快取
+        self.reset()
+
+    def reset(self):
+        self.offset = 0
+        self.agents: dict[str, dict] = {}
+        self.ver += 1
+
+    def feed(self, path: str, size: int) -> bool:
+        """讀 offset 之後新增的完整行（寫到一半的那行下次再讀）；有變動回傳 True。"""
+        if size < self.offset:
+            self.reset()
+        if size <= self.offset:
+            return False
+        pos, carry, changed = self.offset, b'', False
+        with open(path, 'rb') as f:
+            f.seek(pos)
+            while True:
+                chunk = f.read(BG_CHUNK)
+                if not chunk:
+                    break
+                buf = carry + chunk
+                cut = buf.rfind(b'\n')
+                if cut < 0:
+                    carry = buf
+                    continue
+                for raw in buf[:cut].split(b'\n'):
+                    changed = self._line(raw) or changed
+                pos += cut + 1
+                carry = buf[cut + 1:]
+        self.offset = pos
+        if changed:
+            self.ver += 1
+        return changed
+
+    def _line(self, raw: bytes) -> bool:
+        try:
+            rec = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            return False
+        if not isinstance(rec, dict):
+            return False
+        typ = rec.get('type')
+        key = rec.get('key') if isinstance(rec.get('key'), str) and rec['key'] else None
+        aid = rec.get('agentId') if isinstance(rec.get('agentId'), str) and rec['agentId'] else None
+        if typ == 'launched':
+            for a in self.agents.values():
+                if a['status'] == 'running':
+                    a['status'] = 'abandoned'  # 前一次嘗試沒做完的
+            return True
+        if typ == 'started' and (key or aid):
+            self.agents[key or aid] = {
+                'agentId': aid, 'status': 'running', 'start': None, 'end': None, 'try': None,
+                'label': squash(rec['label']) if isinstance(rec.get('label'), str) and rec['label'].strip() else None,
+                'phase': rec['phase'] if isinstance(rec.get('phase'), str) else None,
+            }
+            return True
+        if typ in ('result', 'failed'):
+            a = self.agents.get(key or aid)
+            if a is None and aid:
+                a = next((x for x in self.agents.values() if x['agentId'] == aid), None)
+            if a is not None:
+                a['status'] = 'done' if typ == 'result' else 'failed'
+                return True
+        return False
+
+    def times(self, run_dir: str, now: int) -> bool:
+        """補上 agent 的開始（meta.json 的 mtime）與結束（transcript 的 mtime，只在結束後）。已經知道的不再看；
+        找不到檔案的最多每 BG_PROBE_MS 再試一次。label 缺少時順便用 meta.json 的 description。有變動回傳 True。"""
+        changed = False
+        for a in self.agents.values():
+            aid = a['agentId']
+            want_end = a['status'] in ('done', 'failed') and a['end'] is None
+            if not aid or a['status'] == 'abandoned' or (a['start'] is not None and not want_end):
+                continue
+            if a['try'] is not None and now - a['try'] < BG_PROBE_MS:
+                continue
+            a['try'] = now
+            if a['start'] is None:
+                meta = os.path.join(run_dir, f'agent-{aid}.meta.json')
+                try:
+                    a['start'] = os.stat(meta).st_mtime * 1000
+                    changed = True
+                except OSError:
+                    pass
+                else:
+                    if a['label'] is None:
+                        d = read_json(meta)
+                        desc = d.get('description') if isinstance(d, dict) else None
+                        a['label'] = squash(desc) if isinstance(desc, str) and desc.strip() else None
+            if want_end:
+                try:
+                    a['end'] = os.stat(os.path.join(run_dir, f'agent-{aid}.jsonl')).st_mtime * 1000
+                    changed = True
+                except OSError:
+                    pass
+            if a['start'] is not None and (a['end'] is not None or not want_end):
+                a['try'] = None
+        if changed:
+            self.ver += 1
+        return changed
+
+
+def _phase_share(phases, agents, finished) -> float:
+    """依階段算的完成比例（未封頂）：Σ(階段 k 的 finished 數÷已開始數，k ≤ 已開始的最大階段；那之前沒有 agent 的階段算 1)÷N。
+    每個階段各算再加總：pipeline() 會讓好幾個階段同時在跑，只看最後開始的階段會高估；
+    中間沒有 agent 的階段當作做完了（script 依結果跳過的，例如沒有發現就不跑 Fix）。"""
+    if not agents:
+        return 0.0
+    idx = [phases.index(a['phase']) for a in agents]
+    done = 0.0
+    for k in range(max(idx) + 1):
+        ks = [a for a, i in zip(agents, idx) if i == k]
+        done += sum(1 for a in ks if finished(a)) / len(ks) if ks else 1
+    return done / len(phases)
+
+
+def workflow_progress(phases, agents, start_at) -> dict | None:
+    """一個執行中 workflow 的進度。agents：journal 的 agent（放棄的不算）；start_at：workflow 工作的開始時間。
+    有 phases（N 個 title）而且每個 agent 的 phase 都在裡面：p＝_phase_share（還在跑，最多 0.99），
+    文字「階段 c+1/N · P%」（c＝已開始的最大階段），好幾個階段同時在跑時是「階段 最早還在跑的–c+1/N · P%」，可以算 ETA；
+    否則（舊格式、沒宣告 phases、phase 對不上）只有「已結束數/已開始數」。
+    ETA：最近一個結束的 agent 的結束時間 t_c（檔案 mtime，重開 widget 結果一樣），剩餘 R＝(t_c − 開始)×(1−p)÷(p−p0)，
+    回傳到期時間 t_c＋R（繪製時減掉現在，每秒倒數）。p0 是開始時就已經有的進度（同一批 agent，只算開始前就結束的）：
+    resume 沿用同一份 journal，這次之前做完的不能算成這次的速度；被跳過的階段也不花時間。還沒有 agent 開始時回傳 None。"""
+    # resume 不一定寫 launched：開始時間早於這次啟動、卻還沒結束的 agent 是前一次嘗試被砍掉留下的，不算
+    live = [a for a in agents if a.get('status') != 'abandoned'
+            and not (a.get('status') == 'running' and start_at and a.get('start') is not None and a['start'] < start_at)]
+    if not live:
+        return None
+    fin = [a for a in live if a['status'] in ('done', 'failed')]
+    n = len(phases) if phases else 0
+    p = None
+    if phases and all(a.get('phase') in phases for a in live):
+        idx = [phases.index(a['phase']) for a in live]
+        c = max(idx)
+        p = min(_phase_share(phases, live, lambda a: a['status'] in ('done', 'failed')), 0.99)
+        lo = min((i for a, i in zip(live, idx) if a['status'] == 'running'), default=c)
+        label = f'階段 {c + 1}/{n} · {int(p * 100)}%' if lo == c else f'階段 {lo + 1}–{c + 1}/{n} · {int(p * 100)}%'
+    else:
+        label = f'{len(fin)}/{len(live)}'
+    ends = [a['end'] for a in fin if a.get('end')]
+    eta_at = None
+    if p is not None and ends and start_at and max(ends) > start_at:
+        p0 = _phase_share(phases, live, lambda a: a.get('end') is not None and a['end'] < start_at)
+        if p - p0 > 0:
+            tc = max(ends)
+            eta_at = tc + (tc - start_at) * (1 - p) / (p - p0)
+    rows = []
+    for a in sorted(live, key=lambda a: (0, a.get('start') or 0) if a['status'] == 'running' else (1, -(a.get('end') or 0))):
+        text = a.get('label') or (a['agentId'] or '')[:8]
+        if n > 1 and a.get('phase'):
+            text = f"{a['phase']}：{text}"
+        rows.append({'label': text, 'status': a['status'], 'start': a.get('start'), 'end': a.get('end')})
+    return {'label': label, 'p': p, 'etaAts': [eta_at] if eta_at is not None else None, 'n': len(live), 'agents': rows}
+
+
+def mod_task(x: dict) -> dict:
+    """mod 檔的一個工作 → 算總進度用的形式 {id, kind, label, start, end, running}。"""
+    run = x.get('status') in ('running', 'pending')
+    return {'id': x.get('id'), 'kind': x.get('kind') if x.get('kind') in KIND_TEXT else 'tool',
+            'label': squash(x['label']) if isinstance(x.get('label'), str) else '',
+            'start': num(x.get('startedAt')), 'end': None if run else num(x.get('endedAt')), 'running': run}
+
+
+def busy_since_of(tasks: list[dict], since=None):
+    """這段忙碌期的開始時間：mod 有寫 busySince 就用它；沒有（舊版 mod、transcript 來源）就用推的：
+    執行中工作最早的開始時間，再把在那之後才結束的工作納入、用它們的開始時間往前延伸，重複到不再變動。"""
+    if since is not None:
+        return since
+    starts = [t['start'] for t in tasks if t['running'] and t['start']]
+    if not starts:
+        return None
+    since = min(starts)
+    while True:
+        # 容許 BUSY_GAP_MS 的空檔（和 mod 的靜置時間一樣）：背景工作結束後，處理它的通知回合要過幾十毫秒才開始
+        back = min((t['start'] for t in tasks
+                    if not t['running'] and t['start'] and t['end'] is not None and t['end'] >= since - BUSY_GAP_MS),
+                   default=since)
+        if back >= since:
+            return since
+        since = back
+
+
+def sub_tasks(tasks: list[dict], since) -> list[dict]:
+    """工作階段的子任務 S：agent／背景指令／workflow／監看，還在跑、或在這段忙碌期內結束的（不算回合與前景工具）。"""
+    return [t for t in tasks if t['kind'] in BG_KINDS
+            and (t['running'] or (since is not None and t['end'] is not None and t['end'] >= since))]
+
+
+def session_progress(subs: list[dict], turn_on: bool, etas: dict | None = None) -> dict | None:
+    """工作階段的總進度：子任務 2 個以上才有「已完成數/總數」；每個執行中的子任務都有 ETA（目前只有 workflow 會有）
+    而且主回合沒有在跑時，再加上其中最大的 ETA。etas：子任務 id → 它的到期時間（沒有就不放）。"""
+    if len(subs) < 2:
+        return None
+    run = [t for t in subs if t['running']]
+    ats = [(etas or {}).get(t['id']) for t in run]
+    ok = bool(run) and not turn_on and all(a is not None for a in ats)
+    return {'label': f'{len(subs) - len(run)}/{len(subs)}', 'etaAts': ats if ok else None}
+
+
+def prog_text(p: dict | None, now: float) -> str:
+    """進度文字：「2/5 · 約剩 8 分」「階段 2/4 · 60% · 約剩 8 分」。ETA 每秒倒數；超過預估（有一個到期）就只留前半。"""
+    if not p:
+        return ''
+    ats = p.get('etaAts')
+    if ats and all(a > now for a in ats):
+        return f"{p['label']} · {fmt_eta(max(ats) - now)}"
+    return p['label']
+
+
+def run_dir_of(L: dict, tx_path: str, sid: str) -> str | None:
+    """transcript 來源的 workflow run 資料夾：啟動結果的 transcriptDir（hints 裡資料夾名是 runId 的那個），
+    還沒有結果（例如 resume 剛送出）就用 <專案資料夾>\\<sid>\\subagents\\workflows\\<runId>。"""
+    run = L.get('run')
+    if L.get('kind') != 'workflow' or not run:
+        return None
+    for h in L.get('hints') or []:
+        if base_name(h) == run:
+            return h
+    return os.path.join(os.path.dirname(tx_path), sid, 'subagents', 'workflows', run)
 
 
 # ---------- Claude desktop app：側邊欄的未讀黃點（唯讀） ----------
@@ -1833,7 +2198,7 @@ def session_from_mod(sid: str, m: dict, info, now: int, reg=None) -> dict:
         'lastDoneAt': ld_at, 'lastDoneErr': bool(ld.get('isError')) if ld else False,
         'lastDoneKind': ld.get('kind') if ld and isinstance(ld.get('kind'), str) else None,
         'lastDoneDur': num(ld.get('durationMs')) if ld else None,
-        'interrupted': False, 'isError': False, 'tasks': [], 'attn': None,
+        'interrupted': False, 'isError': False, 'tasks': [], 'attn': None, 'subs': [],
     }
     attn = parse_attention(m.get('attention'), upd)
     rows: list[dict] = []
@@ -1846,11 +2211,23 @@ def session_from_mod(sid: str, m: dict, info, now: int, reg=None) -> dict:
             kind = x.get('kind') if x.get('kind') in KIND_TEXT else 'tool'
             # 和 mod 的判斷一致：subagent 是背景啟動的（有 toolUseId），或主回合已經結束還在跑，才算背景
             bg = kind in BG_KINDS and (kind != 'agent' or isinstance(x.get('toolUseId'), str) or not turn_on)
-            rows.append({
-                'kind': kind, 'bg': bg, 'startAt': num(x.get('startedAt')),
+            row = {
+                'id': x.get('id'), 'kind': kind, 'bg': bg, 'startAt': num(x.get('startedAt')),
                 'label': squash(x['label']) if isinstance(x.get('label'), str) else '',
                 'detail': squash(x['detail']) if isinstance(x.get('detail'), str) else '',
-            })
+            }
+            if kind == 'workflow' and isinstance(x.get('runDir'), str) and x['runDir']:
+                # 新版 mod 記下的 run 資料夾與 script（算進度用）；舊版沒有：只顯示耗時
+                row.update(run=base_name(x['runDir']), runDir=x['runDir'],
+                           scriptPath=x['scriptPath'] if isinstance(x.get('scriptPath'), str) and x['scriptPath'] else None)
+            rows.append(row)
+        # 總進度的子任務：Artifact 的自動追蹤不算；忙碌期的開始用 mod 寫的 busySince（舊版沒有或是 null：用推的）
+        # 前景（同步）subagent 不算：和 transcript 來源一樣只數背景啟動的（mod 有標 toolUseId；從通知補建的是 bg: 開頭）
+        work = [mod_task(x) for x in tasks
+                if not (x.get('kind') == 'monitor' and ARTIFACT_WATCH_RE.search(str(x.get('label') or '')))
+                and not (x.get('kind') == 'agent' and not isinstance(x.get('toolUseId'), str)
+                         and not str(x.get('id')).startswith('bg:'))]
+        s['subs'] = sub_tasks(work, busy_since_of(work, num(m.get('busySince'))))
         title = s['title']
         labels = [('背景：' if r['bg'] else '') + ('回應中' if r['kind'] == 'turn' and same_as_title(r['label'], title) else r['label'])
                   for r in rows if r['label']]
@@ -1965,8 +2342,28 @@ def session_from_tx(sid: str, t: dict, info: dict, now: int, mod: dict | None = 
             start = min([start] + [L['start'] for L in alive if L['start']])
         for L in opened:
             ok = L.get('live', True)
-            tasks.append({'kind': L['kind'], 'label': L['label'], 'startAt': L['start'], 'bg': True,
-                          'stale': not ok, 'detail': '' if ok else mins(L)})
+            row = {'id': L.get('id'), 'kind': L['kind'], 'label': L['label'], 'startAt': L['start'], 'bg': True,
+                   'stale': not ok, 'detail': '' if ok else mins(L)}
+            if L['kind'] == 'workflow' and L.get('runDir'):
+                row.update(run=L['run'], runDir=L['runDir'], scriptPath=L.get('script'))
+            tasks.append(row)
+    # 總進度的子任務：開著的背景工作、BgScan 記下的最近結束的（沒有 busySince，忙碌期的開始用推的）
+    turns = [r['startAt'] for r in tasks if r['kind'] == 'turn']
+    if not turns and info['status'] == 'running':
+        turns = [info['turnStart'] or info['oldestTs'] or int(t['mtime'])]  # 在等你時回合那一列被拿掉了，回合其實還在跑
+    work = ([{'id': 'turn', 'kind': 'turn', 'label': '', 'start': at, 'end': None, 'running': True} for at in turns]
+            + [{'id': L.get('id'), 'kind': L['kind'], 'label': L['label'], 'start': L['start'], 'end': None, 'running': True}
+               for L in opened]
+            + [dict(D, running=False) for D in (bg or {}).get('done') or []]
+            # 最近一個已經結束的主回合：忙碌期靠它接起「背景工作結束 → 通知回合 → 又啟動的工作」
+            + ([{'id': 'turn:last', 'kind': 'turn', 'label': '', 'start': info['turnStart'], 'end': info['doneAt'], 'running': False}]
+               if info['status'] == 'idle' and info['turnStart'] and info['doneAt'] else []))
+    # 忙碌期的開始用推的；Collector 記得這段忙碌期之前推出來的（bg['since']），比較早就沿用：
+    # 之後又有回合時，原本接起忙碌期的那個回合已經不在推算的資料裡
+    since = busy_since_of(work)
+    hint = (bg or {}).get('since')
+    if hint is not None and status in ACTIVE and (since is None or hint < since):
+        since = hint
     cwd = info['cwd'] or (mod.get('cwd') if mod and isinstance(mod.get('cwd'), str) else '') or ''
     proj = base_name(cwd)
     if status == 'idle':
@@ -1983,7 +2380,7 @@ def session_from_tx(sid: str, t: dict, info: dict, now: int, mod: dict | None = 
         if status == 'idle' and info['status'] == 'idle' and not info['interrupted'] and not info['local'] else None,
         'lastDoneAt': None, 'lastDoneErr': False, 'lastDoneKind': None, 'lastDoneDur': None,
         'interrupted': info['interrupted'], 'isError': info['isError'], 'tasks': tasks, 'bgOpen': len(opened),
-        'attn': None,
+        'attn': None, 'subs': sub_tasks(work, since), 'busySince': since,
     }, attn)
 
 
@@ -2118,11 +2515,57 @@ def task_lines(s: dict) -> list[dict]:
     return rows
 
 
+def agent_lines(sid: str, wf: dict) -> list[dict]:
+    """workflow 展開後的 agent 行（第 2 層）：● 執行中、✓ 完成、✗ 失敗；執行中在前，再來是最近結束的。
+    最多 WF_AGENT_LINES 行，其餘併成「+N 個已完成」（併掉的含執行中的時候寫「+N 個 agent」）。"""
+    rows = wf.get('agents') or []
+    keep = rows if len(rows) <= WF_AGENT_LINES else rows[:WF_AGENT_LINES - 1]
+    out = [{'type': 'task', 'sid': sid, 'depth': 2, 'toggle': None, 'open': False, 'prog': '',
+            't': {'kind': '', 'label': a['label'], 'startAt': a['start'], 'endAt': a['end'] if a['status'] != 'running' else None,
+                  'mark': '●' if a['status'] == 'running' else '✗' if a['status'] == 'failed' else '✓',
+                  'ended': a['status'] != 'running'}} for a in keep]
+    rest = rows[len(keep):]
+    if rest:
+        word = '已完成' if all(a['status'] != 'running' for a in rest) else ' agent'
+        out.append({'type': 'task', 'sid': sid, 'depth': 2, 'toggle': None, 'open': False, 'prog': '',
+                    't': {'kind': '', 'label': f'+{len(rest)} 個{word}', 'startAt': None, 'ended': True, 'count': len(rest)}})
+    return out
+
+
+def task_groups(s: dict, expanded, now: float) -> tuple[list, bool]:
+    """一個工作階段底下要列的行，分組成 (工作那一行, 它展開的 agent 行)。回傳 (groups, 工作階段是否展開)。
+    工作階段收合：和 task_lines 一樣。展開（子任務 2 個以上才能展開）：全部子任務加上執行中的回合與工具，
+    執行中在前（依開始時間）、再來是已結束的（最近結束的在前）；在等什麼那一行仍然排第一。
+    workflow 有 2 個以上 agent 才能展開（key：sid/run:<runId>），展開時在它下面列出 agent。"""
+    sid = s['sid']
+    rows = task_lines(s)
+    opened = sid in expanded and s['status'] in ACTIVE and bool(s.get('prog'))
+    if opened:
+        head = [r for r in rows if r.get('attn')]
+        run = sorted((r for r in rows if not r.get('attn')), key=lambda r: (r.get('startAt') is None, r.get('startAt') or 0))
+        ended = sorted((t for t in s.get('subs') or [] if not t['running']), key=lambda t: -(t['end'] or 0))
+        rows = head + run + [{'kind': t['kind'], 'label': t['label'], 'startAt': t['start'], 'endAt': t['end'], 'ended': True}
+                             for t in ended]
+    groups = []
+    for r in rows:
+        wf = r.get('wf')
+        key = f"{sid}/run:{r['run']}" if wf and wf['n'] >= 2 and r.get('run') else None
+        on = key is not None and key in expanded
+        groups.append(({'type': 'task', 'sid': sid, 't': r, 'depth': 1, 'toggle': key, 'open': on, 'prog': prog_text(wf, now)},
+                       agent_lines(sid, wf) if on else []))
+    return groups, opened
+
+
 def running_model(sessions: list[dict], flashing, max_lines: int = RUN_LINES, per: int = RUN_TASKS,
-                  unread=frozenset(), unread_max: int = UNREAD_LINES) -> list[dict]:
+                  unread=frozenset(), unread_max: int = UNREAD_LINES, expanded=frozenset(), expand_lines: int = EXPAND_LINES,
+                  now: float | None = None) -> list[dict]:
     """只看執行中模式要畫的行：session／task／more／empty。
     順序：在等你、執行中，最後是做完但還沒打開的（unread：每個一行、不列工作，直到你打開或標為已讀；
-    最多 unread_max 個，較舊的併成最後的「+N 個未讀」，不會擠掉執行中的）。"""
+    最多 unread_max 個，較舊的併成最後的「+N 個未讀」，不會擠掉執行中的）。
+    session／task 行另外帶 depth（0 工作階段、1 它的工作、2 workflow 的 agent）、toggle（可切換展開的 key，不能展開是 None）、
+    open（展開中）、prog（進度文字）。expanded 裡有正在顯示的工作階段或 workflow 時，行數上限放寬成 expand_lines。"""
+    now = now_ms() if now is None else now
+    orig_lines = max_lines
     vis = [s for s in sessions if s['status'] in ACTIVE or s['sid'] in flashing or s['sid'] in unread]
     quiet = [s for s in vis if s['status'] not in ACTIVE and s['sid'] not in flashing]  # 只是還沒打開（sessions 新的在前）
     hide = {s['sid'] for s in quiet[max(0, unread_max):]}
@@ -2132,7 +2575,17 @@ def running_model(sessions: list[dict], flashing, max_lines: int = RUN_LINES, pe
         return [{'type': 'more', 'text': f'+{hidden} 個未讀'}] if hidden else [{'type': 'empty', 'text': '目前沒有執行中的工作'}]
     vis = ([s for s in vis if s['status'] == 'attention'] + [s for s in vis if s['status'] in ACTIVE and s['status'] != 'attention']
            + [s for s in vis if s['status'] not in ACTIVE])
-    rows_of = [task_lines(s) if s['status'] in ACTIVE or s['sid'] in flashing else [] for s in vis]
+    grouped = [task_groups(s, expanded, now) if s['status'] in ACTIVE or s['sid'] in flashing else ([], False) for s in vis]
+    for i, s in enumerate(vis):
+        g, o = grouped[i]
+        if not o and len(g) > per:
+            # 收合的工作階段只列前面幾個工作：被藏起來的 workflow 就算展開過，也不列它的 agent、不放寬行數
+            n = max(1 if s['status'] == 'attention' else 0, per - 1)
+            grouped[i] = ([(e, kids if j < n else []) for j, (e, kids) in enumerate(g)], o)
+    rows_of = [g for g, _o in grouped]
+    relaxed = expand_lines > max_lines and any(o or any(kids for _e, kids in g) for g, o in grouped)
+    if relaxed:
+        max_lines = expand_lines
     # 在等你的工作階段一定要看得到：每個先保留標題一行，還有空間就從前面開始再保留在等什麼那一行
     a_idx = [i for i, s in enumerate(vis) if s['status'] == 'attention']
     extra = 1 if len(vis) > len(a_idx) or hidden else 0  # 「+N 個」那一行
@@ -2155,21 +2608,41 @@ def running_model(sessions: list[dict], flashing, max_lines: int = RUN_LINES, pe
             only_unread = all(x['status'] not in ACTIVE and x['sid'] not in flashing for x in vis[i:])
             out.append({'type': 'more', 'text': f'+{n} 個未讀' if only_unread else f'+{n} 個'})
             break
-        out.append({'type': 'session', 's': s})
-        rows = rows_of[i]
-        room = min(per, left - 1)
-        if len(rows) <= room:
-            keep = rows
-        elif s['status'] == 'attention':
-            keep = rows[:max(1, room - 1)] if room >= 1 else []  # 在等什麼那一行不能被「+N 個工作」擠掉
+        groups, opened = grouped[i]
+        on = s['status'] in ACTIVE
+        out.append({'type': 'session', 's': s, 'depth': 0, 'toggle': s['sid'] if on and s.get('prog') else None, 'open': opened,
+                    'prog': prog_text(s.get('prog'), now) if on else ''})
+        attn = s['status'] == 'attention'
+        avail = left - 1
+        n_tasks = len(groups)
+        more = not opened and len(groups) > per  # 收合時最多 per 個工作（展開的 workflow 底下的 agent 另外算）
+        if more:
+            groups = groups[:max(1 if attn else 0, per - 1)]
+        flat = [x for e, kids in groups for x in [e] + kids]
+        if len(flat) + (1 if more else 0) > avail:
+            keep = flat[:max(1 if attn else 0, avail - 1)] if avail >= 1 else []  # 在等什麼那一行不能被「+N 個工作」擠掉
+            more = True
         else:
-            keep = rows[:max(0, room - 1)]
-        out += [{'type': 'task', 'sid': s['sid'], 't': r} for r in keep]
-        if len(keep) < len(rows) and room >= 1 and len(keep) < room:
-            out.append({'type': 'task', 'sid': s['sid'], 't': {'kind': '', 'label': f'+{len(rows) - len(keep)} 個工作', 'startAt': None}})
+            keep = flat
+        out += keep
+        if more and avail >= 1 and len(keep) < avail:
+            # 數的是工作，不是行；工作都列出來了、只是展開的 workflow 的 agent 放不下時才寫「+N 個 agent」
+            shown = sum(1 for x in keep if x['depth'] == 1)
+            if n_tasks > shown:
+                label = f'+{n_tasks - shown} 個工作'
+            else:
+                agents = sum(len(x['t']['wf']['agents']) for x in keep if x['depth'] == 1 and x['open'] and x['t'].get('wf'))
+                seen = sum(1 if x['t'].get('mark') else x['t'].get('count', 0) for x in keep if x['depth'] == 2)
+                label = f'+{agents - seen} 個 agent'
+            out.append({'type': 'task', 'sid': s['sid'], 'depth': 1, 'toggle': None, 'open': False, 'prog': '',
+                        't': {'kind': '', 'label': label, 'startAt': None}})
     else:
         if hidden:
             out.append({'type': 'more', 'text': f'+{hidden} 個未讀'})
+    if relaxed and not any(x.get('open') for x in out):
+        # 展開的工作階段或 workflow 根本排不進來：照沒有展開的行數重排
+        return running_model(sessions, flashing, max_lines=orig_lines, per=per, unread=unread, unread_max=unread_max,
+                             expanded=expanded, expand_lines=orig_lines, now=now)
     return out
 
 
@@ -2182,6 +2655,11 @@ class Collector:
         self.title_cache: dict[str, tuple] = {}
         self.bg: dict[str, BgScan] = {}
         self.live_cache: dict[str, tuple] = {}
+        self.journals: dict[str, WfJournal] = {}  # workflow 的 runId → 增量讀的 journal
+        self.phase_cache: dict[str, tuple] = {}  # script 路徑 → ((mtime, size), phases)
+        self.tx_since: dict[str, tuple] = {}  # transcript 來源的工作階段 → (這段忙碌期推出來的開始時間, 最後一次還在忙的時間)
+        self.wf_cache: dict[str, tuple] = {}  # runId → (依據, workflow_progress 的結果)
+        self.prog_errs: set = set()  # 讀進度時出錯的檔案（同一個檔案只記一次 log）
         self.full_scans = 0
         self.expansions = 0
         self.steps = TAIL_STEPS
@@ -2326,15 +2804,82 @@ class Collector:
                         live, quiet = True, 0  # Claude 自己說還在忙（含背景工作）
                     elif L['start'] and all(p['status'] == 'idle' and (p['since'] or 0) > L['start'] + REG_MARGIN_MS for p in procs):
                         continue  # 啟動之後 Claude 已經閒置過：工作已經結束（例如在介面上停掉，沒有留下通知）
-                opened.append(dict(L, live=live, quietMs=quiet))
+                opened.append(dict(L, live=live, quietMs=quiet, runDir=run_dir_of(L, path, sid)))
             live = any(L['live'] for L in opened)
             quiet = min((L['quietMs'] for L in opened), default=0)
             q = sc.q_last
             return {'open': opened, 'live': live or not opened, 'quietMs': quiet, 'notifAt': sc.notif_at,
-                    'queued': (q[1], q[2]) if q and q[0] == 'enqueue' else None}
+                    'queued': (q[1], q[2]) if q and q[0] == 'enqueue' else None, 'done': list(sc.done)}
         except Exception:
             Log.exc(f'bg {sid}')
             return None
+
+    def _prog_err(self, path: str, err) -> None:
+        if path not in self.prog_errs:
+            self.prog_errs.add(path)
+            Log.write(f'進度：讀不到 {path}：{err}')
+
+    def _phases(self, path: str) -> list[str] | None:
+        """script 的 meta.phases，依 (path, mtime, size) 快取；讀不到或沒宣告回傳 None。"""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        key = (st.st_mtime_ns, st.st_size)
+        hit = self.phase_cache.get(path)
+        if hit is None or hit[0] != key:
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                    phases = parse_phases(f.read(SCRIPT_HEAD))
+            except Exception as e:
+                self._prog_err(path, e)
+                phases = None
+            hit = self.phase_cache[path] = (key, phases)
+        return hit[1]
+
+    def wf_view(self, run_dir: str, script, start_at, now: int, used: set) -> dict | None:
+        """一個執行中 workflow 的進度（workflow_progress 的結果）；journal 還沒寫或讀不到回傳 None（只顯示耗時）。
+        每輪只 stat journal 與 script，各 agent 的時間知道了就不再看；結果依 journal 內容與 phases 快取。
+        快取以 runId（run 資料夾名）為 key：同一個工作階段在 mod／transcript 兩種來源間切換時接著用。"""
+        key = base_name(run_dir) or run_dir
+        used.add(key)
+        phases = None
+        if script:
+            used.add(script)
+            phases = self._phases(script)
+        path = os.path.join(run_dir, 'journal.jsonl')
+        try:
+            size = os.stat(path).st_size
+        except OSError:
+            return None
+        J = self.journals.get(key)
+        if J is None:
+            J = self.journals[key] = WfJournal()
+        try:
+            J.feed(path, size)
+            J.times(run_dir, now)
+        except Exception as e:
+            self._prog_err(path, e)
+            return None
+        sig = (J.ver, tuple(phases) if phases else None, start_at)
+        hit = self.wf_cache.get(key)
+        if hit is None or hit[0] != sig:
+            hit = self.wf_cache[key] = (sig, workflow_progress(phases, list(J.agents.values()), start_at))
+        return hit[1]
+
+    def add_progress(self, s: dict, now: int, used: set) -> None:
+        """執行中的工作階段：每個有 run 資料夾的 workflow 列帶上 wf（進度與 agent 清單），工作階段帶上 prog（總進度）。"""
+        if s['status'] not in ACTIVE:
+            return
+        etas = {}
+        for r in s['tasks']:
+            if r.get('kind') == 'workflow' and r.get('runDir'):
+                w = self.wf_view(r['runDir'], r.get('scriptPath'), r.get('startAt'), now, used)
+                if w is not None:
+                    r['wf'] = w
+                    if w['etaAts']:
+                        etas[r.get('id')] = w['etaAts'][0]
+        s['prog'] = session_progress(s.get('subs') or [], any(r.get('kind') == 'turn' for r in s['tasks']), etas)
 
     def _cached(self, path: str, key: str, now: int, fn) -> float:
         box = self.live_cache.setdefault(path, {})
@@ -2513,16 +3058,30 @@ class Collector:
             Log.exc('registry')
             reg = {}
             self.reg_ok = False
+        used: set = set()  # 這一輪用到的 workflow run 資料夾與 script（其餘的快取丟掉）
         for sid in set(mods) | set(txs):
             try:
                 m, t = mods.get(sid), txs.get(sid)
                 info = self.infer(t) if t is not None else None
                 bg = self.bg_view(sid, t, now) if t is not None and info is not None and mod_view(m, t, now) == 'tx' else None
+                if bg is not None:
+                    bg['since'] = (self.tx_since.get(sid) or (None,))[0]
                 s = merge_session(sid, m, t, info, now, bg, reg.get(sid), self.reg_ok)
+                if s is not None and s['source'] == 'transcript' and s['status'] in ACTIVE and s.get('busySince'):
+                    self.tx_since[sid] = (s['busySince'], now)  # 這段忙碌期還沒結束：下一輪接著用
+                elif sid in self.tx_since and (s is None or now - self.tx_since[sid][1] > BUSY_GAP_MS + REFRESH_MS):
+                    del self.tx_since[sid]  # 回合之間短暫的閒置不算結束（和推算忙碌期一樣容許 BUSY_GAP_MS）
                 if s is not None:
                     sessions.append(s)
+                    try:
+                        self.add_progress(s, now, used)
+                    except Exception:
+                        Log.exc(f'progress {sid}')  # 算不出進度：照樣顯示工作階段，只是沒有進度文字
             except Exception:
                 Log.exc(f'collect {sid}')
+        for cache in (self.journals, self.wf_cache, self.phase_cache):
+            for k in [k for k in cache if k not in used]:
+                del cache[k]
         try:
             self.desk.refresh(now)
             self.desk.annotate(sessions, reg)
@@ -2891,7 +3450,7 @@ class Row:
 
 
 class Line:
-    """只看執行中模式的一行：工作階段（圖示、標題、時間）或它底下的一個工作（種類、說明、時間）。"""
+    """只看執行中模式的一行：工作階段（圖示、▸／▾、標題、進度、時間）或它底下的一個工作（▸／▾、種類、說明、進度、時間）。"""
 
     def __init__(self, app: 'App', parent):
         tk = app.tk
@@ -2904,11 +3463,19 @@ class Line:
         self.glyph.pack(fill='both', expand=True)
         self.time = tk.Label(self.frame, text='', bg=BG, fg=DIM, font=app.f_small, anchor='e', padx=0, pady=0, bd=0)
         self.time.pack(side='right')
+        self.prog = tk.Label(self.frame, text='', bg=BG, fg=ACCENT, font=app.f_small, anchor='e', padx=0, pady=0, bd=0)
+        self.prog.pack(side='right')
+        # 展開／收合的箭頭：固定寬度（不能展開時是空白但保留寬度，文字才會對齊）；第 2 層的列用加寬的空白縮排
+        self.abox = tk.Frame(self.frame, bg=BG, width=app.aw, height=app.f_main.metrics('linespace'))
+        self.abox.pack_propagate(False)
+        self.abox.pack(side='left')
+        self.arrow = tk.Label(self.abox, text='', bg=BG, fg=DIM, font=app.f_sym, anchor='e', padx=0, pady=0, bd=0)
+        self.arrow.pack(fill='both', expand=True)
         self.kind = tk.Label(self.frame, text='', bg=BG, fg=YELLOW, font=app.f_small, anchor='w', padx=0, pady=0, bd=0)
         self.kind.pack(side='left')
         self.text = tk.Label(self.frame, text='', bg=BG, fg=FG, font=app.f_main, anchor='w', padx=0, pady=0, bd=0, width=1)
         self.text.pack(side='left', fill='x', expand=True)
-        self.widgets = (self.frame, self.gbox, self.glyph, self.time, self.kind, self.text)
+        self.widgets = (self.frame, self.gbox, self.glyph, self.time, self.prog, self.abox, self.arrow, self.kind, self.text)
         self.role = None
         self.state = None
         self.gstate = None
@@ -2917,6 +3484,7 @@ class Line:
         self.spinning = False
         self.pulsing = False  # 在等你：這個工作階段的每一行底色都跟著脈動
         self.sid: str | None = None  # 這一行屬於哪個工作階段（工作那幾行也算）
+        self.toggle: str | None = None  # 點箭頭要切換展開的 key（不能展開是 None）
         self.cursor = ''
 
     def show(self):
@@ -2937,21 +3505,27 @@ class Line:
                 w.configure(bg=bg)
             self.bg = bg
 
-    def set(self, role, bg, kind, kcolor, text, tfg, ttext, tcolor, bold=False):
+    def set(self, role, bg, kind, kcolor, text, tfg, ttext, tcolor, bold=False, arrow='', acolor=DIM, prog='', pcolor=ACCENT, depth=1):
         app, s = self.app, self.app.scale
         if (role, bold) != self.role:
             sess = role == 'session'
             self.frame.configure(pady=int(3 * s) if sess else 0)
-            self.gbox.configure(height=(app.f_main if sess else app.f_small).metrics('linespace'))
+            h = (app.f_main if sess else app.f_small).metrics('linespace')
+            self.gbox.configure(height=h)
+            self.abox.configure(height=h)
             self.text.configure(font=(app.f_bold if bold else app.f_main) if sess else (app.f_bold_small if bold else app.f_small))
             self.role = (role, bold)
             self.state = None
         self.set_bg(bg)
-        st = (kind, kcolor, text, tfg, ttext, tcolor)
+        st = (kind, kcolor, text, tfg, ttext, tcolor, arrow, acolor, prog, pcolor, depth)
         if st == self.state:
             return
+        if self.state is None or self.state[-1] != depth:
+            self.abox.configure(width=app.aw * max(1, depth))
+        self.arrow.configure(text=arrow, fg=acolor)
         self.kind.configure(text=kind, fg=kcolor, padx=int(3 * s) if kind else 0)
         self.text.configure(text=text or ' ', fg=tfg)
+        self.prog.configure(text=prog, fg=pcolor, padx=int(3 * s) if prog else 0)
         self.time.configure(text=ttext, fg=tcolor)
         self.state = st
 
@@ -3062,6 +3636,7 @@ class App:
         self.W = int(BASE_WIDTH * s)
         self.pad = int(10 * s)
         self.gw = int(22 * s)
+        self.aw = int(14 * s)  # 只看執行中模式的 ▸／▾（也是第 2 層多縮排的寬度）
         root.configure(bg=BORDER)
         outer = tk.Frame(root, bg=BG)
         outer.pack(fill='both', expand=True, padx=1, pady=1)
@@ -3136,13 +3711,24 @@ class App:
         self.lines_pad.pack(side='bottom', fill='x')
         self.lbl_more = tk.Label(self.body, text='', fg=DIM, bg=BG, font=self.f_small, anchor='w', padx=self.pad, pady=int(3 * s))
         self.lbl_empty = tk.Label(self.body, text='', fg=DIM, bg=BG, font=self.f_small, anchor='w', padx=self.pad, pady=int(8 * s))
-        for row in self.rows + self.lines:  # 點一下工作階段（不拖曳）：在 Claude desktop app 開啟；標題列仍然是拖曳的地方
-            for w in row.widgets:
-                w.bind('<ButtonPress-1>', lambda e, r=row: self._row_press(e, r))
-                w.bind('<ButtonRelease-1>', lambda e, r=row: self._row_release(e, r))
-                self._row_of[str(w)] = row
+        for row in self.rows + self.lines:
+            self._bind_row(row)
         self._build_menu()
         root.bind_all('<Button-3>', self._popup)
+
+    def _bind_row(self, row):
+        """點一下工作階段（不拖曳）：在 Claude desktop app 開啟（點箭頭是展開／收合）；標題列仍然是拖曳的地方。"""
+        for w in row.widgets:
+            w.bind('<ButtonPress-1>', lambda e, r=row: self._row_press(e, r))
+            w.bind('<ButtonRelease-1>', lambda e, r=row: self._row_release(e, r))
+            self._row_of[str(w)] = row
+
+    def _grow_lines(self, n: int) -> None:
+        """有展開時只看執行中模式的元件池跟著長到需要的行數（最多 EXPAND_LINES）；不會縮回去，用不到的藏起來。"""
+        while len(self.lines) < min(n, EXPAND_LINES):
+            ln = Line(self, self.lines_box)
+            self.lines.append(ln)
+            self._bind_row(ln)
 
     def _build_menu(self):
         tk = self.tk
@@ -3235,7 +3821,10 @@ class App:
                 attn = self.attn_tracker.update(snap['sessions'])
                 if alerts or attn:
                     self._on_alerts(alerts, attn, {s['sid'] for s in snap['sessions'] if s['status'] == 'attention'})
-                if prune_marks(self.cfg['readMarks'], snap['sessions'], snap['at']):
+                dirty = prune_marks(self.cfg['readMarks'], snap['sessions'], snap['at'])
+                if prune_expanded(self.cfg['expanded'], snap['sessions']):
+                    dirty = True
+                if dirty:
                     save_config(self.cfg_path, self.cfg)
             self.render(snap)
         except Exception:
@@ -3363,8 +3952,10 @@ class App:
     def _render_running(self, sessions, snap, now, t):
         for row in self.rows:
             row.hide()
-        model = running_model(sessions, set(self.flash), unread=self._unread_now) if snap is not None else []
+        model = running_model(sessions, set(self.flash), unread=self._unread_now, expanded=set(self.cfg['expanded']),
+                              now=now) if snap is not None else []
         items = [e for e in model if e['type'] in ('session', 'task')]
+        self._grow_lines(len(items))
         by = {s['sid']: s for s in sessions}
         for i, ln in enumerate(self.lines):
             if i < len(items):
@@ -3379,8 +3970,13 @@ class App:
         return more, empty
 
     def _render_line(self, ln: Line, e: dict, by: dict, now: int, t: float):
-        inner = self.W - 2 - 2 * self.pad - self.gw
+        depth = e.get('depth', 1)
+        inner = self.W - 2 - 2 * self.pad - self.gw - self.aw * max(1, depth)
         gap = int(8 * self.scale)
+        prog = e.get('prog') or ''
+        pw = self.f_small.measure(prog) + int(6 * self.scale) if prog else 0
+        ln.toggle = e.get('toggle')
+        arrow = ('▾' if e.get('open') else '▸') if ln.toggle else ''
         if e['type'] == 'session':
             s = e['s']
             attn = s['status'] == 'attention'
@@ -3388,8 +3984,9 @@ class App:
             bg = pulse_color(t) if attn else fl[1] if fl else BG
             ttext, tcolor = self._time_text(s, now)
             font = self.f_bold if attn else self.f_main
-            title = fit_text(s['title'], inner - self.f_small.measure(ttext) - gap, font.measure)
-            ln.set('session', bg, '', DIM, title, ATTN_TEXT if attn else FG, ttext, tcolor, bold=attn)
+            title = fit_text(s['title'], inner - self.f_small.measure(ttext) - pw - gap, font.measure)
+            ln.set('session', bg, '', DIM, title, ATTN_TEXT if attn else FG, ttext, tcolor, bold=attn,
+                   arrow=arrow, acolor=ATTN_SUB if attn else DIM, prog=prog, pcolor=ATTN_SUB if attn else ACCENT, depth=0)
             ln.set_glyph(*self._glyph(s, t))
             ln.spinning = s['status'] == 'running'
             ln.pulsing = attn
@@ -3403,22 +4000,34 @@ class App:
         bg = pulse_color(t) if attn else fl[1] if fl else BG
         kind = KIND_TEXT.get(r.get('kind') or '', '')
         kcolor = ATTN_SUB if attn else ORANGE if r.get('stale') else ACCENT if r.get('bg') else YELLOW
+        if r.get('mark'):  # workflow 的 agent：● 執行中、✓ 完成、✗ 失敗（紅色）
+            kind = r['mark']
+            kcolor = ATTN_SUB if attn else RED if kind == '✗' else YELLOW if kind == '●' else DIM
+        elif r.get('ended'):  # 工作階段展開後已結束的子任務：暗色、前面加 ✓
+            kind = f'✓ {kind}' if kind else ''
+            kcolor = ATTN_SUB if attn else DIM
         label = r.get('label') or ''
         if r.get('detail'):
             label = f'{label} · {r["detail"]}' if label else r['detail']
-        ttext = fmt_elapsed(now - r['startAt']) if r.get('startAt') else ''
-        room = inner - (self.f_small.measure(kind) + int(6 * self.scale) if kind else 0) - self.f_small.measure(ttext) - gap
+        if r.get('endAt') and r.get('startAt'):
+            ttext = fmt_elapsed(r['endAt'] - r['startAt'])  # 已結束：顯示耗時
+        else:
+            ttext = fmt_elapsed(now - r['startAt']) if r.get('startAt') else ''
+        room = inner - (self.f_small.measure(kind) + int(6 * self.scale) if kind else 0) - self.f_small.measure(ttext) - pw - gap
         if r.get('attn'):
             tfg = ATTN_TEXT
         elif attn:
             tfg = ATTN_SUB
         elif r.get('done'):
             tfg = RED if owner.get('lastDoneErr') or owner.get('isError') else GREEN
+        elif r.get('ended'):
+            tfg = DIM
         else:
             tfg = ORANGE if r.get('stale') else FG
         bold = bool(r.get('attn'))
         text = fit_text(label, room, (self.f_bold_small if bold else self.f_small).measure)
-        ln.set('task', bg, kind, kcolor, text, tfg, ttext, ATTN_SUB if attn else DIM, bold=bold)
+        ln.set('task', bg, kind, kcolor, text, tfg, ttext, ATTN_SUB if attn else DIM, bold=bold,
+               arrow=arrow, acolor=ATTN_SUB if attn else DIM, prog=prog, pcolor=ATTN_SUB if attn else ACCENT, depth=depth)
         ln.set_glyph('', DIM)
         ln.spinning = False
         ln.pulsing = attn
@@ -3441,6 +4050,9 @@ class App:
         row.set_glyph(*self._glyph(s, t))
         self._set_link(row, s)
         ttext, tcolor = self._time_text(s, now)
+        prog = prog_text(s.get('prog'), now) if st in ACTIVE else ''
+        if prog:  # 全部工作階段畫面只在耗時前面加上總進度，不提供展開
+            ttext = f'{prog} · {ttext}'
         inner = self.W - 2 - 2 * self.pad - self.gw
         font = self.f_bold if attn else self.f_main
         title = fit_text(s['title'], inner - self.f_small.measure(ttext) - int(10 * self.scale), font.measure)
@@ -3586,14 +4198,34 @@ class App:
         self._fit(force=True)
 
     def _row_press(self, e, row):
-        self._press = (e.x_root, e.y_root, row.sid) if row.sid else None
+        self._press = (e.x_root, e.y_root, row.sid, getattr(e, 'widget', None)) if row.sid else None
 
     def _row_release(self, e, row):
-        """在同一列按下又放開、中間沒有拖曳：在 Claude desktop app 開啟那個工作階段。"""
+        """在同一列按下又放開、中間沒有拖曳：在 Claude desktop app 開啟那個工作階段；
+        在可以展開的列的箭頭上按下並放開：切換展開，不開啟（放開時已經移出箭頭就取消）。"""
         p, self._press = self._press, None
         if p is None or p[2] != row.sid or abs(e.x_root - p[0]) > CLICK_SLOP or abs(e.y_root - p[1]) > CLICK_SLOP:
             return
+        key = getattr(row, 'toggle', None)
+        if key and p[3] is not None and p[3] in (getattr(row, 'abox', None), getattr(row, 'arrow', None)):
+            w = p[3]
+            if 0 <= e.x < w.winfo_width() and 0 <= e.y < w.winfo_height():
+                self.toggle_expand(key)
+            return
         self.open_session(row.sid)
+
+    def toggle_expand(self, key: str) -> None:
+        """展開／收合一個工作階段（key＝sid）或 workflow（sid/run:<runId>）；記在 widget.json，工作階段消失後清掉。"""
+        keys = self.cfg['expanded']
+        if key in keys:
+            keys.remove(key)
+        else:
+            keys.append(key)
+            del keys[:-EXPANDED_MAX]
+        save_config(self.cfg_path, self.cfg)
+        with self.lock:
+            snap = self.snap
+        self.render(snap)
 
     def open_session(self, sid) -> str | None:
         """用 claude://claude.ai/epitaxy/<local id> 叫 desktop app 打開這個工作階段（它會自己清掉黃點）；回傳開的連結。"""
@@ -3917,6 +4549,56 @@ def build_fixtures(tmp: str, now: int) -> dict:
     with open(os.path.join(sess, 'mod-bad.json'), 'w', encoding='utf-8') as f:
         f.write('{"sessionId": "bad", ')
     return {'data': data, 'projects': proj, 'mod_run': mod_run, 'paths': paths, 'cwd': cwd, 'pdir': pdir}
+
+
+WF_AGENTS = (('a1aaaaaaaaaaaaaaa', 'Research', 'research:docs', -590_000, -400_000),
+             ('a2bbbbbbbbbbbbbbb', 'Build', 'build:ui', -400_000, -200_000),
+             ('a3ccccccccccccccc', 'Build', None, -400_000, None))  # (agentId, phase, label, 開始, 結束)，相對於 t
+
+
+def _wf_fixture(run_dir: str, script: str, t: int) -> None:
+    """一個執行中 workflow 的 run 資料夾（測試用）：宣告 3 個階段的 script；journal 裡 Research 1 個做完、Build 2 個做完 1 個
+    （第 3 個沒有 label，用 meta.json 的 description）；agent 檔的 mtime 就是開始／結束時間。
+    workflow 在 t−600 秒開始 → 階段 2/3 · 50%，最近一個在 t−200 秒結束，ETA 到期在 t＋200 秒。"""
+    os.makedirs(os.path.dirname(script), exist_ok=True)
+    with open(script, 'w', encoding='utf-8', newline='\n') as f:
+        f.write("export const meta = {\n  name: 'demo',\n  description: '示範 {進度} 用的 workflow',\n  phases: [\n"
+                "    { title: 'Research', detail: \"找資料、看 'API'\" },\n    { title: \"Build\" },  // 實作\n    { title: `Review` },\n"
+                "  ],\n}\n\nexport default async function () {}\n")
+    st = lambda i: dict({'type': 'started', 'key': f'v2:{WF_AGENTS[i][0]}', 'agentId': WF_AGENTS[i][0], 'phase': WF_AGENTS[i][1]},
+                        **({'label': WF_AGENTS[i][2]} if WF_AGENTS[i][2] else {}))
+    res = lambda i: {'type': 'result', 'key': f'v2:{WF_AGENTS[i][0]}', 'agentId': WF_AGENTS[i][0], 'result': '做好了 {"x": 1}'}
+    _jsonl(os.path.join(run_dir, 'journal.jsonl'), [{'type': 'launched'}, st(0), res(0), st(1), st(2), res(1)], t - 200_000)
+    for aid, phase, label, start, end in WF_AGENTS:
+        meta = os.path.join(run_dir, f'agent-{aid}.meta.json')
+        write_json(meta, {'agentType': 'workflow-subagent', 'description': label or 'build:api', 'workflowPhase': phase})
+        os.utime(meta, ((t + start) / 1000, (t + start) / 1000))
+        _jsonl(os.path.join(run_dir, f'agent-{aid}.jsonl'), [{'type': 'user'}], t + (end if end is not None else -1_000))
+
+
+def build_progress(data: str, pdir: str, now: int, sid: str = 'mod-wf') -> dict:
+    """進度的測試資料：一個新版 mod 的工作階段（有 busySince），跑完一個背景指令、還在跑一個 workflow（_wf_fixture）。
+    總進度 1/2，ETA 和 workflow 一樣（主回合已經結束）。"""
+    run = 'wf_demo0001-abc'
+    run_dir = os.path.join(pdir, sid, 'subagents', 'workflows', run)
+    script = os.path.join(pdir, sid, 'workflows', 'scripts', f'demo-{run}.js')
+    _wf_fixture(run_dir, script, now)
+    path = os.path.join(data, 'sessions', f'{sid}.json')
+    _mod(path, {
+        'v': 1, 'sessionId': sid, 'cwd': 'C:\\work\\alpha', 'title': '進度示範', 'state': 'running',
+        'startedAt': now - 900_000, 'updatedAt': now - 1_000, 'busySince': now - 700_000,
+        'tasks': [
+            {'id': 'turn:0', 'kind': 'turn', 'label': '更早的問題', 'status': 'completed', 'startedAt': now - 860_000, 'endedAt': now - 800_000},
+            {'id': 'bg:old', 'kind': 'shell', 'label': '上一段忙碌期的指令', 'status': 'completed', 'startedAt': now - 850_000,
+             'endedAt': now - 750_000},
+            {'id': 'turn:1', 'kind': 'turn', 'label': '跑 workflow', 'status': 'completed', 'startedAt': now - 700_000, 'endedAt': now - 590_000},
+            {'id': 'bg:sh1', 'kind': 'shell', 'label': '跑測試', 'status': 'completed', 'startedAt': now - 650_000, 'endedAt': now - 300_000},
+            {'id': 'bg:wf1', 'kind': 'workflow', 'label': '示範 workflow', 'status': 'running', 'startedAt': now - 600_000,
+             'toolUseId': 'toolu_wf1', 'runDir': run_dir, 'scriptPath': script},
+        ],
+        'usage': None, 'lastDone': None,
+    })
+    return {'sid': sid, 'run': run, 'run_dir': run_dir, 'script': script, 'path': path}
 
 
 # ---------- 自我測試 ----------
@@ -4770,6 +5452,373 @@ def selftest_misc(tmp: str, check) -> None:
         a.close()
 
 
+def selftest_progress(tmp: str, check) -> None:
+    """進度與預估剩餘時間：phases 解析、journal 增量讀、workflow／工作階段的總進度、ETA、展開後的行、展開狀態的保存。"""
+    now = now_ms()
+    near = lambda a, b: a is not None and abs(a - b) < 5  # 檔案 mtime 換算成 ms 會有一點誤差
+
+    # fmt_eta 的邊界：不到 1 分鐘、無條件進位、整點省略分鐘
+    check(fmt_eta(0) == '約剩 <1 分' and fmt_eta(59_999) == '約剩 <1 分' and fmt_eta(60_000) == '約剩 1 分'
+          and fmt_eta(60_001) == '約剩 2 分' and fmt_eta(59 * 60_000) == '約剩 59 分', 'fmt_eta minutes')
+    check(fmt_eta(59 * 60_000 + 1) == '約剩 1 小時' and fmt_eta(3600_000) == '約剩 1 小時' and fmt_eta(3600_001) == '約剩 1 小時 1 分'
+          and fmt_eta(125 * 60_000) == '約剩 2 小時 5 分' and fmt_eta(25 * 3600_000) == '約剩 25 小時', 'fmt_eta hours')
+
+    # phases 解析：單引號、雙引號、反引號、多行、註解與字串裡的括號
+    P = parse_phases
+    head = "// 開頭的註解\nexport const meta = {\n  name: 'demo',\n  description: 'a {b} [c] // 不是註解 \\' }',\n"
+    check(P(head + "  phases: [{ title: 'Research', detail: \"it's {x}\" }, { title: \"Build\" }, { title: `Review` }],\n}\nrest()")
+          == ['Research', 'Build', 'Review'], 'phases: three quote styles')
+    multi = ("export const meta = {\n  name: 'x',\n  phases: [\n    {\n      title:\n        'Research',  /* 多行 */\n"
+             "      detail: `看 ${'{'} 文件`,\n    },\n    { 'title': '  Fix   bugs ', detail: 'title: 不是這個' },\n  ],\n}\n")
+    check(P(multi) == ['Research', 'Fix bugs'], f'phases: multi-line, quoted key, title text inside a value {P(multi)}')
+    check(P("export const meta = { other: { phases: [{ title: 'X' }] }, phases: [{ title: 'A' }] }") == ['A'], 'phases: only meta.phases')
+    check(P("export const meta = {\n  name: 'x',\n  description: 'no phases',\n}\nexport default 1") is None, 'phases: none declared')
+    check(P("export const meta = { name: 'x', phases: [] }") is None, 'phases: empty')
+    check(P("export const meta = { name: 'x', phases: [{ title: 'A' }") is None, 'phases: meta never closes')
+    check(P("export const meta = { name: 'x, phases: [{ title: 'A' }] }") is None, 'phases: unterminated string')
+    check(P("export const meta = { phases: [{ title: 'A' }, { detail: 'no title' }] }") is None, 'phases: an entry without a title')
+    check(P("export const meta = { phases: [{ title: NAME }] }") is None, 'phases: title is not a literal')
+    check(P("const meta = { phases: [{ title: 'A' }] }") is None and P(None) is None and P('') is None, 'phases: no export const meta')
+
+    # journal：只讀完整的行、去重、launched 重置、failed、檔案變小重讀
+    rd = os.path.join(tmp, 'wfrun')
+    jp = os.path.join(rd, 'journal.jsonl')
+    os.makedirs(rd, exist_ok=True)
+    js = lambda *recs: ''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in recs)
+    S_ = lambda k, a, **kw: dict({'type': 'started', 'key': k, 'agentId': a}, **kw)
+
+    def put(text, mode='a'):
+        with open(jp, mode, encoding='utf-8', newline='\n') as f:
+            f.write(text)
+        return os.path.getsize(jp)
+    J = WfJournal()
+    size = put(js({'type': 'launched'}, S_('k1', 'aaaa1111bbbb', label='研究', phase='A'), S_('k2', 'aaaa2222bbbb', phase='A'),
+                  {'type': 'result', 'key': 'k1', 'agentId': 'aaaa1111bbbb', 'result': {'x': [1, 2]}})
+               + 'not json\n' + '{"type":"result","key":"k2","agentId":"aaaa2222', 'w')
+    check(J.feed(jp, size) and J.agents['k1']['status'] == 'done' and J.agents['k2']['status'] == 'running'
+          and J.agents['k1']['label'] == '研究' and J.offset < size, f'journal: complete lines only, half line waits {J.agents}')
+    check(not J.feed(jp, size), 'journal: nothing new, nothing read')
+    size = put('bbbb"}\n')
+    check(J.feed(jp, size) and J.agents['k2']['status'] == 'done' and J.offset == size, f'journal: half line finished {J.agents}')
+    size = put(js(S_('k3', 'aaaa3333bbbb', phase='B'), {'type': 'launched'}, S_('k3', 'aaaa3333cccc', phase='B'),
+                  S_('k4', 'aaaa4444bbbb', phase='B'), {'type': 'failed', 'key': 'k4', 'agentId': 'aaaa4444bbbb'}))
+    J.feed(jp, size)
+    check(J.agents['k3'] == dict(J.agents['k3'], agentId='aaaa3333cccc', status='running') and J.agents['k4']['status'] == 'failed'
+          and len(J.agents) == 4, f'journal: same key restarted overwrites, failed {J.agents}')
+    size = put(js(S_('k5', 'aaaa5555bbbb', phase='B'), {'type': 'launched'}))
+    J.feed(jp, size)
+    check(J.agents['k5']['status'] == 'abandoned' and J.agents['k3']['status'] == 'abandoned' and J.agents['k1']['status'] == 'done',
+          f'journal: launched abandons the unfinished attempt {J.agents}')
+    ver = J.ver
+    size = put(js({'type': 'launched'}, S_('z1', 'zzzz1111', phase='A')), 'w')
+    check(J.feed(jp, size) and list(J.agents) == ['z1'] and J.ver > ver, f'journal: file got smaller, read again from the top {J.agents}')
+    # agent 的開始／結束時間（meta.json／transcript 的 mtime）、label 備援、找不到檔案時不每秒重試
+    _jsonl(jp, [{'type': 'launched'}, S_('m1', 'm1aaaaaaaaaa'), S_('m2', 'm2bbbbbbbbbb'),
+                {'type': 'result', 'key': 'm1', 'agentId': 'm1aaaaaaaaaa'}], now)
+    J = WfJournal()
+    J.feed(jp, os.path.getsize(jp))
+    write_json(os.path.join(rd, 'agent-m1aaaaaaaaaa.meta.json'), {'description': '從 meta 來的 label'})
+    os.utime(os.path.join(rd, 'agent-m1aaaaaaaaaa.meta.json'), ((now - 90_000) / 1000,) * 2)
+    _jsonl(os.path.join(rd, 'agent-m1aaaaaaaaaa.jsonl'), [{}], now - 30_000)
+    check(J.times(rd, now) and near(J.agents['m1']['start'], now - 90_000) and near(J.agents['m1']['end'], now - 30_000)
+          and J.agents['m1']['label'] == '從 meta 來的 label' and J.agents['m2']['start'] is None, f'journal: agent times {J.agents}')
+    write_json(os.path.join(rd, 'agent-m2bbbbbbbbbb.meta.json'), {'agentType': 'workflow-subagent'})
+    check(not J.times(rd, now + 1000) and J.agents['m2']['start'] is None, 'journal: a missing file is not retried every second')
+    check(J.times(rd, now + BG_PROBE_MS) and J.agents['m2']['start'] is not None and J.agents['m2']['label'] is None, 'journal: retried later')
+    w = workflow_progress(None, list(J.agents.values()), now - 100_000)
+    check([a['label'] for a in w['agents']] == ['m2bbbbbb', '從 meta 來的 label'], f'agent label falls back to the id {w["agents"]}')
+
+    # workflow 進度：有 phases、沒有 phases、phase 對不上、p 最多 0.99；ETA 倒數、超過預估隱藏、沒有結束的沒有 ETA
+    def A(phase, status, start=None, end=None, label=None, aid='a9999999zzzz'):
+        return {'agentId': aid, 'label': label, 'phase': phase, 'status': status, 'start': start, 'end': end}
+    ph = ['Research', 'Build', 'Review', 'Fix']
+    ags = [A('Research', 'done', now - 500_000, now - 300_000, 'r'), A('Build', 'done', now - 300_000, now - 100_000, 'b1'),
+           A('Build', 'running', now - 300_000, label='b2'), A('Build', 'abandoned', now - 400_000, label='old')]
+    w = workflow_progress(ph, ags, now - 500_000)
+    want = now - 100_000 + 400_000 * (1 - 0.375) / 0.375
+    check(w['label'] == '階段 2/4 · 37%' and w['p'] == 0.375 and w['n'] == 3 and near(w['etaAts'][0], want), f'workflow progress {w}')
+    check(prog_text(w, now) == '階段 2/4 · 37% · 約剩 10 分' and prog_text(w, now + 300_000) == '階段 2/4 · 37% · 約剩 5 分',
+          f'eta counts down {prog_text(w, now)} / {prog_text(w, now + 300_000)}')
+    check(prog_text(w, want) == '階段 2/4 · 37%' and prog_text(w, want + 60_000) == '階段 2/4 · 37%', 'past the estimate: eta hidden')
+    check([a['label'] for a in w['agents']] == ['Build：b2', 'Build：b1', 'Research：r'] and w['agents'][0]['status'] == 'running',
+          f'agent rows: running first, then latest finished, phase prefix {w["agents"]}')
+    w = workflow_progress(None, ags, now - 500_000)
+    check(w['label'] == '2/3' and w['p'] is None and w['etaAts'] is None, f'no phases: finished/started only {w}')
+    w = workflow_progress(ph, ags + [A('Deploy', 'running', now)], now - 500_000)
+    check(w['label'] == '2/4' and w['etaAts'] is None, f'phase not in the list: finished/started only {w}')
+    w = workflow_progress(ph, [A('Research', 'done', end=now - 1), A('Fix', 'done', end=now - 1), A('Fix', 'failed', end=now)], now - 9_000)
+    check(w['label'] == '階段 4/4 · 99%' and w['p'] == 0.99 and near(w['etaAts'][0], now + 9_000 * 0.01 / 0.49),
+          f'p capped at 0.99; skipped phases before the last started one count as done {w}')
+    # pipeline()：好幾個階段同時在跑，每個階段各算比例（Research 1、Build 1/2、Review 0/1）÷4，不是只看最後開始的 Review
+    w = workflow_progress(ph, [A('Research', 'done', end=now - 1), A('Build', 'done', end=now - 1), A('Build', 'running', now),
+                               A('Review', 'running', now)], now - 9_000)
+    check(w['label'] == '階段 2–3/4 · 37%' and w['p'] == 0.375, f'pipeline: several phases at once {w}')
+    # resume：同一份 journal 裡上一次做完的 agent 不算成這次的速度（p0），否則 ETA 會低估很多
+    w = workflow_progress(['Research', 'Build'], [
+        A('Research', 'done', now - 4000_000, now - 3000_000), A('Build', 'done', now - 3000_000, now - 2000_000),
+        A('Build', 'running', now - 90_000), A('Build', 'done', now - 90_000, now - 30_000)], now - 100_000)
+    check(w['label'] == '階段 2/2 · 83%' and near(w['etaAts'][0], now - 30_000 + 70_000 * (1 - 5 / 6) / (5 / 6 - 4 / 6)),
+          f'resumed run: rate from this attempt only {w}')
+    w = workflow_progress(['Research', 'Build'], [A('Research', 'done', now - 4000_000, now - 3000_000), A('Build', 'running', now - 90_000)],
+                          now - 100_000)
+    check(w['etaAts'] is None, f'resumed run: nothing finished in this attempt yet, no eta {w}')
+    # resume 不一定寫 launched：上一次嘗試還標著執行中的 agent（開始時間早於這次啟動）不算進總數，也不列出來
+    w = workflow_progress(['Research', 'Build'], [
+        A('Research', 'done', now - 4000_000, now - 3000_000), A('Build', 'running', now - 3000_000, label='orphan'),
+        A('Build', 'running', now - 90_000, label='new'), A('Build', 'done', now - 90_000, now - 30_000, label='ok')], now - 100_000)
+    check(w['label'] == '階段 2/2 · 75%' and w['n'] == 3 and 'Build：orphan' not in [a['label'] for a in w['agents']]
+          and near(w['etaAts'][0], now + 40_000), f'resumed run without launched: the old unfinished agent is dropped {w}')
+    w = workflow_progress(ph, [A('Research', 'done'), A('Build', 'running', now)], now - 9_000)
+    check(w['label'] == '階段 2/4 · 25%' and w['etaAts'] is None, f'no finish time known: no eta {w}')
+    w = workflow_progress(ph, [A('Research', 'running', now)], now - 9_000)
+    check(w['label'] == '階段 1/4 · 0%' and w['etaAts'] is None, f'nothing finished: no eta {w}')
+    check(workflow_progress(['Only'], [A('Only', 'running', label='x')], now)['agents'][0]['label'] == 'x', 'one phase: no prefix')
+    check(workflow_progress(ph, [], now) is None and workflow_progress(ph, [A('Build', 'abandoned')], now) is None, 'no agents yet')
+
+    # 工作階段的總進度：mod 有 busySince
+    watch = {'id': 'bg:aw', 'kind': 'monitor', 'label': 'live updates for artifact https://claude.ai/artifact/x', 'status': 'running',
+             'startedAt': now - 3600_000}
+    base = [
+        {'id': 'turn:0', 'kind': 'turn', 'label': '更早', 'status': 'completed', 'startedAt': now - 800_000, 'endedAt': now - 700_000},
+        {'id': 'bg:old', 'kind': 'shell', 'label': '上一段的', 'status': 'completed', 'startedAt': now - 900_000, 'endedAt': now - 650_000},
+        {'id': 'agent:1', 'kind': 'agent', 'label': '研究', 'status': 'completed', 'startedAt': now - 500_000, 'endedAt': now - 400_000,
+         'toolUseId': 'toolu_a1'},
+        {'id': 'agent:fg', 'kind': 'agent', 'label': '前景', 'status': 'completed', 'startedAt': now - 450_000, 'endedAt': now - 420_000},
+        {'id': 'bg:g', 'kind': 'shell', 'label': '通知補建的', 'status': 'completed', 'startedAt': now - 300_000, 'endedAt': now - 300_000},
+        {'id': 'bg:w', 'kind': 'workflow', 'label': '整理', 'status': 'running', 'startedAt': now - 450_000},
+        {'id': 'bg:m', 'kind': 'monitor', 'label': '看錯誤', 'status': 'running', 'startedAt': now - 200_000},
+        {'id': 'tool:1', 'kind': 'tool', 'label': 'Bash', 'status': 'running', 'startedAt': now - 2_000}, watch]
+    run = {'state': 'running', 'startedAt': now - 900_000, 'updatedAt': now, 'lastDone': None, 'busySince': now - 600_000}
+    s = session_from_mod('pg', dict(run, tasks=base), None, now)
+    check(sorted(t['id'] for t in s['subs']) == ['agent:1', 'bg:g', 'bg:m', 'bg:w'],
+          f'subtasks with busySince; a foreground subagent (no toolUseId) is not one {s["subs"]}')
+    check(session_progress(s['subs'], False) == {'label': '2/4', 'etaAts': None}, 'session progress: count, no eta while a monitor runs')
+    two = [t for t in s['subs'] if t['id'] != 'bg:m']
+    check(session_progress(two, False, {'bg:w': now + 60_000}) == {'label': '2/3', 'etaAts': [now + 60_000]}, 'session eta from the workflow')
+    check(session_progress(two, True, {'bg:w': now + 60_000})['etaAts'] is None, 'session eta hidden while the main turn runs')
+    check(session_progress(two, False, {})['etaAts'] is None, 'session eta needs every running subtask to have one')
+    check(session_progress([t for t in two if t['id'] == 'bg:w'], False, {'bg:w': now}) is None, 'one subtask: no session progress')
+    p2 = {'label': '1/3', 'etaAts': [now + 300_000, now + 120_000]}
+    check(prog_text(p2, now) == '1/3 · 約剩 5 分' and prog_text(p2, now + 150_000) == '1/3', 'session eta: the largest, hidden once one is over')
+    # 沒有 busySince（舊版 mod，或是 null）：從執行中的工作往前推
+    inferred = [
+        {'id': 'bg:w', 'kind': 'workflow', 'status': 'running', 'startedAt': now - 100_000},
+        {'id': 'agent:a', 'kind': 'agent', 'status': 'completed', 'startedAt': now - 300_000, 'endedAt': now - 50_000, 'toolUseId': 'tu_a'},
+        {'id': 'bg:s', 'kind': 'shell', 'status': 'completed', 'startedAt': now - 400_000, 'endedAt': now - 250_000},
+        {'id': 'turn:x', 'kind': 'turn', 'status': 'completed', 'startedAt': now - 500_000, 'endedAt': now - 390_000},
+        {'id': 'bg:t', 'kind': 'shell', 'status': 'completed', 'startedAt': now - 900_000, 'endedAt': now - 510_000}]
+    for extra in ({}, {'busySince': None}):
+        s = session_from_mod('pg', dict(run, busySince=None, tasks=inferred) if extra else {k: v for k, v in run.items() if k != 'busySince'} | {'tasks': inferred}, None, now)
+        check(sorted(t['id'] for t in s['subs']) == ['agent:a', 'bg:s', 'bg:w'], f'busy period inferred {extra} {s["subs"]}')
+    check(busy_since_of([mod_task(x) for x in inferred]) == now - 500_000 and busy_since_of([], 7) == 7 and busy_since_of([]) is None,
+          'busy_since_of')
+    # 背景工作結束幾十毫秒後，處理它的通知回合才開始（真實資料 30–211 ms）：推算時要接得起來
+    gap = [{'id': 'bg:A', 'kind': 'shell', 'status': 'completed', 'startedAt': now - 500_000, 'endedAt': now - 300_040},
+           {'id': 'turn:n', 'kind': 'turn', 'status': 'completed', 'startedAt': now - 300_000, 'endedAt': now - 290_000},
+           {'id': 'bg:B', 'kind': 'workflow', 'status': 'running', 'startedAt': now - 295_000}]
+    s = session_from_mod('pg', {k: v for k, v in run.items() if k != 'busySince'} | {'tasks': gap}, None, now)
+    check(sorted(t['id'] for t in s['subs']) == ['bg:A', 'bg:B'], f'busy period inferred across the notification gap {s["subs"]}')
+    s = session_from_mod('pg', dict(run, state='idle', tasks=base), None, now)
+    check(s['status'] == 'idle' and s['subs'] == [], 'idle session: no total progress')
+    ghost = {'id': 'bg:ga', 'kind': 'agent', 'label': '通知補建的 agent', 'status': 'completed', 'startedAt': now - 300_000,
+             'endedAt': now - 300_000}
+    s = session_from_mod('pg', dict(run, tasks=base + [ghost]), None, now)
+    check('bg:ga' in [t['id'] for t in s['subs']], f'a background agent rebuilt from its notification (bg: id) counts {s["subs"]}')
+
+    # transcript 來源：權限確認時回合那一列被拿掉，回合還是算在忙碌期裡，回合中做完的背景工作照樣算
+    blob = lambda rs: b''.join(json.dumps(r, ensure_ascii=False).encode() + b'\n' for r in rs)
+    i = parse_tail(blob([_rec('user', 'w3', now - 100_000, '跑'),
+                         _rec('assistant', 'w3', now - 5_000, [{'type': 'tool_use', 'id': 'a', 'name': 'Bash', 'input': {}}], 'tool_use')]), False)
+    bgd = {'open': [], 'done': [{'id': 'shD', 'kind': 'shell', 'label': 'd', 'start': now - 90_000, 'end': now - 60_000},
+                                {'id': 'shE', 'kind': 'shell', 'label': 'e', 'start': now - 80_000, 'end': now - 70_000}]}
+    reg = [{'status': 'waiting', 'waitingFor': 'permission prompt', 'since': now - 60_000}]
+    sx = session_from_tx('w3', {'mtime': now}, i, now, bg=bgd, reg=reg, reg_on=True)
+    check(sx['status'] == 'attention' and not any(r['kind'] == 'turn' for r in sx['tasks'])
+          and sorted(t['id'] for t in sx['subs']) == ['shD', 'shE'] and sx['busySince'] == parse_ts(iso(now - 100_000)),
+          f'needs-you: the turn still holds the busy period {sx["status"]} {sx["subs"]}')
+
+    # transcript 來源：BgScan 的完成清單（最多 64 個）與 Workflow 的 scriptPath
+    proj, data = os.path.join(tmp, 'pgproj'), os.path.join(tmp, 'pgdata')
+    os.makedirs(os.path.join(data, 'sessions'), exist_ok=True)
+    pdir = os.path.join(proj, 'C--work-alpha')
+    T = lambda sid: os.path.join(pdir, f'{sid}.jsonl')
+    recs = [_rec('user', 'cap', now - 900_000, 'go')]
+    for i in range(70):
+        at = now - 800_000 + i * 1000
+        recs += [_rec('assistant', 'cap', at, _tu(f'c{i}', 'Bash', command='x', description=f'指令 {i}', run_in_background=True), 'tool_use'),
+                 _tr('cap', at + 10, f'c{i}', f'Command running in background with ID: bc{i}.', tur={'backgroundTaskId': f'bc{i}'}),
+                 _rec('user', 'cap', at + 500, _notif(f'bc{i}', f'c{i}'))]
+    recs += [_rec('assistant', 'cap', now - 5_000, _tu('we', 'Workflow', script='x'), 'tool_use'), _tr('cap', now - 4_000, 'we', 'boom', err=True)]
+    _jsonl(T('cap'), recs, now - 4_000)
+    sc = BgScan('cap')
+    sc.feed(T('cap'), os.path.getsize(T('cap')), None)
+    check(len(sc.done) == BG_DONE_MAX and sc.done[0]['id'] == 'c6' and sc.done[-1] == {
+        'id': 'c69', 'kind': 'shell', 'label': '指令 69', 'start': parse_ts(iso(now - 800_000 + 69_000)), 'end': parse_ts(iso(now - 800_000 + 69_500))},
+        f'finished list capped, failed launch not counted {sc.done[-2:]}')
+    run_dir = os.path.join(pdir, 'tx-wf', 'subagents', 'workflows', 'wf_tx000001-abc')
+    script = os.path.join(tmp, 'elsewhere', 'scripts', 'tx-demo.js')
+    _wf_fixture(run_dir, script, now)
+    _jsonl(T('tx-wf'), [
+        _rec('user', 'tx-wf', now - 650_000, '跑'),
+        _rec('assistant', 'tx-wf', now - 640_000, _tu('sh1', 'Bash', command='a', description='第一個指令', run_in_background=True), 'tool_use'),
+        _tr('tx-wf', now - 639_000, 'sh1', 'Command running in background with ID: bs1.', tur={'backgroundTaskId': 'bs1'}),
+        _rec('assistant', 'tx-wf', now - 600_000, _tu('wf1', 'Workflow', scriptPath=os.path.join(tmp, 'input.js')), 'tool_use'),
+        _tr('tx-wf', now - 599_000, 'wf1', 'Workflow launched in background. Task ID: wtx1',
+            tur={'status': 'async_launched', 'taskId': 'wtx1', 'runId': 'wf_tx000001-abc', 'transcriptDir': run_dir, 'scriptPath': script}),
+        _say('tx-wf', now - 590_000), _rec('user', 'tx-wf', now - 300_000, _notif('bs1', 'sh1')), _say('tx-wf', now - 290_000)], now - 290_000)
+    c = Collector(data, proj)
+    c.temp_roots = [os.path.join(tmp, 'pgtemp')]
+    by = {x['sid']: x for x in c.collect(now)['sessions']}
+    s = by['tx-wf']
+    wr = next((r for r in s['tasks'] if r['kind'] == 'workflow'), {})
+    check(s['source'] == 'transcript' and s['status'] == 'running' and wr.get('scriptPath') == script and wr.get('runDir') == run_dir
+          and wr.get('run') == 'wf_tx000001-abc', f'transcript workflow: run dir and scriptPath {wr}')
+    check(sorted(t['id'] for t in s['subs']) == ['sh1', 'wf1'] and s['prog']['label'] == '1/2' and near(s['prog']['etaAts'][0], now + 200_000)
+          and wr['wf']['label'] == '階段 2/3 · 50%', f'transcript session progress {s["subs"]} {s.get("prog")} {wr.get("wf")}')
+
+    # transcript 來源：背景指令結束 → 通知回合啟動 workflow 後也結束；最近結束的主回合把忙碌期接起來
+    _jsonl(T('tx-chain'), [
+        _rec('user', 'tx-chain', now - 650_000, '跑'),
+        _rec('assistant', 'tx-chain', now - 649_000, _tu('shA', 'Bash', command='a', description='先跑的指令', run_in_background=True), 'tool_use'),
+        _tr('tx-chain', now - 648_000, 'shA', 'Command running in background with ID: bsA.', tur={'backgroundTaskId': 'bsA'}),
+        _say('tx-chain', now - 640_000),
+        _rec('user', 'tx-chain', now - 400_000, _notif('bsA', 'shA')),
+        _rec('assistant', 'tx-chain', now - 380_000, _tu('wfB', 'Workflow', script='x'), 'tool_use'),
+        _tr('tx-chain', now - 379_000, 'wfB', 'Workflow launched in background. Task ID: wtxB', tur={'status': 'async_launched', 'taskId': 'wtxB'}),
+        _say('tx-chain', now - 370_000)], now - 370_000)
+    by = {x['sid']: x for x in c.collect(now)['sessions']}
+    s = by['tx-chain']
+    check(s['source'] == 'transcript' and s['status'] == 'running' and sorted(t['id'] for t in s['subs']) == ['shA', 'wfB']
+          and s['prog']['label'] == '1/2', f'transcript: the finished turn bridges the busy period {s["subs"]} {s.get("prog")}')
+    # 之後又有新的回合：接起忙碌期的那個回合已經不在推算的資料裡，沿用 Collector 記下的開始時間
+    check(c.tx_since['tx-chain'] == (s['busySince'], now) and s['busySince'] < parse_ts(iso(now - 640_000)), f'busy start remembered {c.tx_since}')
+    _append(T('tx-chain'), [_rec('user', 'tx-chain', now + 500, '再做一件事')])
+    s = {x['sid']: x for x in c.collect(now + 1000)['sessions']}['tx-chain']
+    check(sorted(t['id'] for t in s['subs']) == ['shA', 'wfB'] and s['prog']['label'] == '1/2',
+          f'transcript: a later turn keeps the remembered busy period {s["subs"]} {s.get("prog")}')
+
+    # 端到端（mod 來源）：讀 script 與 journal、增量更新、快取
+    pf = build_progress(data, pdir, now)
+    by = {x['sid']: x for x in c.collect(now)['sessions']}
+    s = by['mod-wf']
+    wr = next(r for r in s['tasks'] if r['kind'] == 'workflow')
+    w = wr.get('wf') or {}
+    check(w.get('label') == '階段 2/3 · 50%' and w.get('n') == 3 and near((w.get('etaAts') or [None])[0], now + 200_000)
+          and [a['label'] for a in w['agents']] == ['Build：build:api', 'Build：build:ui', 'Research：research:docs'],
+          f'mod workflow progress {w}')
+    check(s['prog']['label'] == '1/2' and prog_text(s['prog'], now) == '1/2 · 約剩 4 分' and prog_text(wr['wf'], now) == '階段 2/3 · 50% · 約剩 4 分',
+          f'mod session progress {s.get("prog")}')
+    J = c.journals[pf['run']]
+    off = J.offset
+    by = {x['sid']: x for x in c.collect(now + 1000)['sessions']}
+    check(J.offset == off and by['mod-wf']['tasks'][-1]['wf'] is w, 'unchanged journal: not re-read, result cached')
+    aid3 = WF_AGENTS[2][0]
+    _jsonl(os.path.join(pf['run_dir'], f'agent-{aid3}.jsonl'), [{}], now - 50_000)
+    with open(os.path.join(pf['run_dir'], 'journal.jsonl'), 'a', encoding='utf-8', newline='\n') as f:
+        f.write(json.dumps({'type': 'result', 'key': f'v2:{aid3}', 'agentId': aid3}) + '\n')
+    by = {x['sid']: x for x in c.collect(now + 2000)['sessions']}
+    w = by['mod-wf']['tasks'][-1]['wf']
+    check(J.offset > off and w['label'] == '階段 2/3 · 66%' and near(w['etaAts'][0], now - 50_000 + 550_000 * (1 - 2 / 3) / (2 / 3)),
+          f'journal read incrementally, eta recomputed when an agent finishes {w}')
+    m = read_json(pf['path'])
+    m['tasks'][-1] = {k: v for k, v in m['tasks'][-1].items() if k not in ('runDir', 'scriptPath')}
+    m['updatedAt'] = now + 3000
+    _mod(pf['path'], m)
+    by = {x['sid']: x for x in c.collect(now + 3000)['sessions']}
+    s = by['mod-wf']
+    check('wf' not in s['tasks'][-1] and s['prog'] == {'label': '1/2', 'etaAts': None} and pf['run'] not in c.journals
+          and pf['script'] not in c.phase_cache and len(c.journals) == 1, f'old mod without runDir: elapsed only, caches dropped {s.get("prog")}')
+    m['tasks'][-1].update(runDir=os.path.join(tmp, 'no-such-run'), scriptPath=os.path.join(tmp, 'no-such.js'))
+    m['updatedAt'] = now + 4000
+    _mod(pf['path'], m)
+    s = {x['sid']: x for x in c.collect(now + 4000)['sessions']}['mod-wf']
+    check('wf' not in s['tasks'][-1] and s['status'] == 'running', 'journal missing: no progress, session still shown')
+
+    # 只看執行中模式的展開：順序、agent 15 行上限與「+N 個已完成」、30 行上限、在等你的列仍然保留
+    def ag(i, status):
+        return {'label': f'ag{i}', 'status': status, 'start': now - 100_000 + i, 'end': None if status == 'running' else now - 1000 * i}
+    wf20 = {'label': '階段 2/3 · 40%', 'p': 0.4, 'etaAts': None, 'n': 20,
+            'agents': [ag(i, 'running') for i in range(2)] + [ag(i, 'done') for i in range(2, 20)]}
+    s1 = {'sid': 's1', 'status': 'running', 'title': 'S1', 'sub': 'x', 'startAt': now - 200_000,
+          'prog': {'label': '2/4', 'etaAts': None},
+          'tasks': [{'id': 'turn:1', 'kind': 'turn', 'label': '回合', 'startAt': now - 50_000, 'bg': False},
+                    {'id': 'bg:w', 'kind': 'workflow', 'label': 'wf', 'startAt': now - 90_000, 'bg': True, 'run': 'wf_x', 'wf': wf20},
+                    {'id': 'bg:s', 'kind': 'shell', 'label': 'sh', 'startAt': now - 80_000, 'bg': True}],
+          'subs': [{'id': 'bg:w', 'kind': 'workflow', 'label': 'wf', 'start': now - 90_000, 'end': None, 'running': True},
+                   {'id': 'bg:s', 'kind': 'shell', 'label': 'sh', 'start': now - 80_000, 'end': None, 'running': True},
+                   {'id': 'agent:1', 'kind': 'agent', 'label': '早', 'start': now - 190_000, 'end': now - 60_000, 'running': False},
+                   {'id': 'bg:d', 'kind': 'shell', 'label': '晚', 'start': now - 100_000, 'end': now - 30_000, 'running': False}]}
+    m = running_model([s1], set(), now=now)
+    check([(e['depth'], e['toggle'], e['open']) for e in m] == [(0, 's1', False), (1, None, False), (1, 's1/run:wf_x', False), (1, None, False)]
+          and m[0]['prog'] == '2/4' and m[2]['prog'] == '階段 2/3 · 40%' and m[1]['prog'] == '', f'collapsed rows {m}')
+    m = running_model([s1], set(), expanded={'s1'}, now=now)
+    check([(e['t']['label'], bool(e['t'].get('ended'))) for e in m[1:]] == [('wf', False), ('sh', False), ('回合', False), ('晚', True), ('早', True)]
+          and m[0]['open'] and m[4]['t']['endAt'] == now - 30_000, f'expanded session: running by start, then latest finished {m[1:]}')
+    m = running_model([s1], set(), expanded={'s1', 's1/run:wf_x'}, now=now)
+    kids = [e for e in m if e['depth'] == 2]
+    check(m[1]['open'] and len(kids) == WF_AGENT_LINES and [e['t']['mark'] for e in kids[:3]] == ['●', '●', '✓']
+          and kids[-1]['t']['label'] == '+6 個已完成' and all(e['type'] == 'task' and e['toggle'] is None for e in kids)
+          and m.index(kids[0]) == 2, f'workflow expanded: 14 agents + "+6 個已完成" right under it {[e["t"]["label"] for e in kids]}')
+    check([e['t']['label'] for e in agent_lines('s1', dict(wf20, agents=wf20['agents'][:15]))][-1] == 'ag14'
+          and len(agent_lines('s1', dict(wf20, agents=wf20['agents'][:15]))) == 15, '15 agents fit without a summary line')
+    busy = dict(wf20, agents=[ag(i, 'running') for i in range(17)])
+    check(agent_lines('s1', busy)[-1]['t']['label'] == '+3 個 agent', 'hidden running agents are not called finished')
+    failed = agent_lines('s1', dict(wf20, agents=[dict(ag(1, 'failed'))]))
+    check(failed[0]['t']['mark'] == '✗' and failed[0]['t']['ended'] and failed[0]['t']['endAt'] == now - 1000, 'failed agent row')
+    m = running_model([s1], set(), expanded={'s1/run:wf_x'}, now=now)
+    check(len(m) == 4 + 15 and m[2]['open'] and not m[0]['open'], 'workflow expanded inside a collapsed session')
+    # 兩個展開的 workflow：第一個的「+6 個已完成」那行也是看得到的 agent，「+N 個 agent」只數第二個放不下的
+    two = dict(s1, sid='s2', tasks=[dict(s1['tasks'][1], id='bg:a', run='wf_a'),
+                                    dict(s1['tasks'][1], id='bg:b', run='wf_b', startAt=now - 80_000)])
+    m = running_model([two], set(), expanded={'s2/run:wf_a', 's2/run:wf_b'}, now=now)
+    check(len(m) == EXPAND_LINES and m[-1]['t']['label'] == '+9 個 agent', f'two expanded workflows: summary line counted {len(m)} {m[-1]}')
+    check(running_model([dict(s1, prog=None)], set(), expanded={'s1'}, now=now)[0]['toggle'] is None, 'one subtask: no arrow, stays collapsed')
+    one_wf = dict(s1, tasks=[dict(s1['tasks'][1], wf=dict(wf20, n=1, agents=wf20['agents'][:1]))])
+    check(running_model([one_wf], set(), expanded={'s1/run:wf_x'}, now=now)[1]['toggle'] is None
+          and running_model([one_wf], set(), now=now)[1]['prog'] == '階段 2/3 · 40%', 'one agent: no arrow, progress text still shown')
+    # 收合的工作階段把展開過的 workflow 藏起來（排在第 4 個以後）：不列它的 agent、不放寬行數，「+N 個工作」數的是工作
+    late = dict(s1, tasks=[dict(s1['tasks'][0], id=f'turn:{i}') if i == 0 else {'id': f'bg:x{i}', 'kind': 'shell', 'label': f'sh{i}',
+                                                                                    'startAt': now - 90_000 + i, 'bg': True}
+                           for i in range(4)] + [s1['tasks'][1]])
+    fill = [dict(s1, sid=f'o{i}', title=f'O{i}', tasks=[], prog=None) for i in range(12)]
+    m = running_model([late] + fill, set(), expanded={'s1/run:wf_x'}, now=now)
+    labels = [e['t']['label'] for e in m if e['type'] == 'task']
+    check(len(m) == RUN_LINES and labels[:4] == ['回合', 'sh1', 'sh2', '+2 個工作'] and not any(e.get('depth') == 2 for e in m),
+          f'hidden expanded workflow: no agent rows, no relaxed limit, tasks counted {len(m)} {labels}')
+    many = [dict(s1, sid=f's{i}', title=f'S{i}', startAt=now - 1000 * i) for i in range(1, 6)]
+    m = running_model(many, set(), now=now)
+    check(len(m) == RUN_LINES, f'nothing expanded: still {RUN_LINES} lines {len(m)}')
+    crowd = [dict(s1, sid=f'c{i}', title=f'C{i}', tasks=[], prog=None) for i in range(35)]
+    m = running_model(crowd + [s1], set(), expanded={'s1'}, now=now)
+    check(len(m) == RUN_LINES and not any(e.get('open') for e in m), f'expanded session out of sight: limit not relaxed {len(m)}')
+    ask = {'sid': 'q1', 'status': 'attention', 'title': 'Q', 'sub': '等你回覆：要繼續嗎？', 'attn': {'reason': 'ask', 'since': now},
+           'prog': {'label': '0/2', 'etaAts': None}, 'tasks': [dict(s1['tasks'][1])], 'subs': s1['subs'][:2]}
+    ex = {f's{i}' for i in range(1, 6)} | {f's{i}/run:wf_x' for i in range(1, 6)}
+    m = running_model(many + [ask], set(), expanded=ex, now=now)
+    check(len(m) == EXPAND_LINES and m[-1] == {'type': 'more', 'text': '+3 個'} and m[0]['s'] is ask and m[1]['t'].get('attn'),
+          f'expanded: {EXPAND_LINES} lines at most, needs-you kept first {len(m)} {m[-1]}')
+    m = running_model([ask, s1], set(), expanded={'q1', 'q1/run:wf_x'}, max_lines=4, expand_lines=5, now=now)
+    check([e['type'] for e in m] == ['session', 'task', 'task', 'task', 'session'] and m[1]['t'].get('attn') and m[0]['open']
+          and m[2]['t']['label'] == 'wf' and m[2]['open'] and m[3]['t']['label'] == '+20 個 agent', f'needs-you line kept above its expanded rows {m}')
+    m = running_model([ask, s1], set(), expanded={'q1', 'q1/run:wf_x'}, max_lines=2, expand_lines=3, now=now)
+    check([e['type'] for e in m] == ['session', 'task', 'session'] and m[1]['t'].get('attn'), f'no room: only the needs-you line stays {m}')
+
+    # 展開狀態：存進 widget.json、格式不對的丟掉、空的不寫、工作階段消失就清掉
+    cfgp = os.path.join(tmp, 'cfgx', 'widget.json')
+    write_json(cfgp, {'expanded': ['s1', 's1/run:wf_x', 's1', 3, '', None, 's9']})
+    cfg = load_config(cfgp)
+    check(cfg['expanded'] == ['s1', 's1/run:wf_x', 's9'], f'expanded cleaned {cfg["expanded"]}')
+    check(load_config(os.path.join(tmp, 'nocfg', 'widget.json'))['expanded'] == [] and clean_expanded('x') == [], 'expanded default')
+    check(prune_expanded(cfg['expanded'], [{'sid': 's1'}]) and cfg['expanded'] == ['s1', 's1/run:wf_x']
+          and not prune_expanded(cfg['expanded'], [{'sid': 's1'}]), 'expanded pruned when the session is gone')
+    save_config(cfgp, cfg)
+    check(read_json(cfgp)['expanded'] == ['s1', 's1/run:wf_x'], 'expanded saved')
+    cfg['expanded'] = []
+    save_config(cfgp, cfg)
+    check('expanded' not in read_json(cfgp), 'empty expanded not written')
+    check(len(clean_expanded([f'k{i}' for i in range(EXPANDED_MAX + 5)])) == EXPANDED_MAX, 'expanded capped')
+
+
 REPLAY_MAX_TRIES = 50  # 最多試幾個背景工作，找第一個能完整重播的
 
 
@@ -5487,7 +6536,7 @@ def selftest_desktop(tmp: str, check, fx: dict) -> None:
     check(seq == [('session', 'a1'), ('task', 'a1'), ('session', 'r1'), ('task', 'r1'), ('session', 'r2'), ('session', 'u1')],
           f'running view order {seq}')
     m = running_model(rs, {'u1'}, unread=un)
-    check(m[-2] == {'type': 'session', 's': rs[0]} and m[-1]['type'] == 'task' and m[-1]['t'].get('done'),
+    check(m[-2]['type'] == 'session' and m[-2]['s'] is rs[0] and m[-1]['type'] == 'task' and m[-1]['t'].get('done'),
           'flashing unread keeps its done line')
     many = [S(f'u{i}', unread=True) for i in range(20)] + [rs[3]]
     m = running_model(many, set(), max_lines=6, unread={f'u{i}' for i in range(20)})
@@ -5844,6 +6893,7 @@ def selftest(replay: str | None = None) -> int:
         selftest_attention(tmp, check)
         selftest_misc(tmp, check)
         selftest_desktop(tmp, check, fx)
+        selftest_progress(tmp, check)
         if replay is None:
             print('REPLAY skipped（沒有指定 --replay <session.jsonl>）')
         else:
@@ -5891,10 +6941,11 @@ def smoke(port: int, seconds: float) -> int:
     DEFAULT_REGISTRY_DIR = os.path.join(tmp, 'noreg')  # 只用測試資料，不讀真正的 Claude Code 行程清單
     try:
         fx = build_fixtures(tmp, now_ms())
+        pf = build_progress(fx['data'], fx['pdir'], now_ms())  # 可以展開的工作階段與 workflow（有進度文字）
         # 也不讀真正的 desktop app：合成的資料夾，tx-idle 做完還沒看過（黃點）、tx-question 只有 id、
-        # mod-stale 是排程工作跑完還沒看過（暗的黃點，不算進 ●N）
+        # mod-stale 是排程工作跑完還沒看過（暗的黃點，不算進 ●N）、進度示範只有 id（點一下開啟）
         DEFAULT_DESKTOP_DIR, desk_ids = build_desktop(tmp, {'tx-idle': ('修好登入的 bug', True), 'tx-question': ('', False),
-                                                            'mod-stale': ('', True, True)}, now_ms())
+                                                            'mod-stale': ('', True, True), pf['sid']: ('', False)}, now_ms())
         set_dpi_aware()
         cfg0 = {'sound': False, 'mode': 'all'}
         wa0 = monitor_work(0, 0)
@@ -6029,6 +7080,56 @@ def smoke(port: int, seconds: float) -> int:
             u['gone'] = 'tx-idle' not in [x.sid for x in app.lines if x.visible]
             app.render(app.snap)
 
+        def progress_check():
+            # 進度文字與 ▸／▾：只畫進度示範的工作階段，在真的箭頭元件上產生按鍵事件（點列的其他地方仍然開啟）
+            pr = res['prog'] = {}
+            snap = app.snap
+            s = next((x for x in (snap or {}).get('sessions', []) if x['sid'] == pf['sid']), None)
+            if s is None:
+                return
+            wr = next((r for r in s['tasks'] if r.get('kind') == 'workflow'), {})
+            pr['collected'] = bool(s.get('prog')) and bool(wr.get('wf')) and wr['wf']['n'] == 3
+            one = dict(snap, sessions=[s])
+            mine = lambda: [x for x in app.lines if x.visible and x.sid == pf['sid']]
+            wkey = f"{pf['sid']}/run:{pf['run']}"
+
+            def click(w):
+                app.root.update_idletasks()
+                rx, ry = w.winfo_rootx() + 2, w.winfo_rooty() + 2
+                w.event_generate('<ButtonPress-1>', x=2, y=2, rootx=rx, rooty=ry)
+                w.event_generate('<ButtonRelease-1>', x=3, y=3, rootx=rx + 1, rooty=ry + 1)
+                app.render(one)
+            app.render(one)
+            lines = mine()
+            if not lines:
+                return
+            pr['text'] = (lines[0].arrow.cget('text') == '▸' and lines[0].prog.cget('text').startswith('1/2 · 約剩')
+                          and any(x.toggle == wkey and x.arrow.cget('text') == '▸' and x.prog.cget('text').startswith('階段 2/3 · 50% · 約剩')
+                                  for x in lines))
+            opened0, n0 = list(app.opened), len(lines)
+            click(lines[0].arrow)  # 展開工作階段：多一行跑完的背景指令
+            n1 = len(mine())
+            pr['expand'] = (n1 == n0 + 1 and mine()[0].arrow.cget('text') == '▾'
+                            and load_config(app.cfg_path)['expanded'] == [pf['sid']])
+            wl = next((x for x in mine() if x.toggle == wkey), None)
+            if wl is None:
+                return
+            click(wl.arrow)  # 展開 workflow：3 個 agent（第 2 層）
+            pr['agents'] = len(mine()) == n1 + 3 and sum(1 for x in mine() if x.state and x.state[-1] == 2) == 3
+            app.render(snap)  # 全部的工作階段：有展開時行數上限放寬，元件池跟著長
+            pr['grow'] = app.visible_lines > RUN_LINES and len(app.lines) >= app.visible_lines
+            app.render(one)
+            click(next(x for x in mine() if x.toggle == wkey).arrow)
+            click(mine()[0].arrow)
+            pr['collapse'] = len(mine()) == n0 and load_config(app.cfg_path).get('expanded') == [] and app.opened == opened0
+            click(mine()[0].text)
+            pr['open'] = app.opened == opened0 + [desktop_url(s.get('localId'))] and s.get('localId') == desk_ids[pf['sid']]
+            app.set_mode('all')  # 全部工作階段畫面：耗時前面加上總進度
+            app.render(one)
+            pr['all'] = app.rows[0].visible and app.rows[0].time.cget('text').startswith('1/2 · 約剩')
+            app.set_mode('running')
+            app.render(app.snap)
+
         def finish():
             w, h, fit = fits()
             res.update(sessions=len(app.snap['sessions']) if app.snap else 0, lines=app.visible_lines,
@@ -6069,6 +7170,7 @@ def smoke(port: int, seconds: float) -> int:
         app.root.after(int(ms * 0.8), snap_all)
         app.root.after(int(ms * 0.83), app.toggle_mode)
         app.root.after(int(ms * 0.88), unread_check)
+        app.root.after(int(ms * 0.93), progress_check)
         app.root.after(ms, finish)
         app.run()
         ok = (res.get('sessions', 0) > 0 and res.get('rows', 0) > 0 and res.get('alerts', 0) >= 1
@@ -6076,7 +7178,8 @@ def smoke(port: int, seconds: float) -> int:
               and res.get('lines', 0) > 0 and res.get('rfit') and res.get('mode') == 'running'
               and res.get('attn_rows', 0) >= 3 and res.get('attn_lines', 0) >= 6 and res.get('frames', 0) >= 2
               and res.get('hdr') and res.get('attn_alerts', 0) >= 1 and 'attention' in res.get('sounds', [])
-              and res.get('unread_hdr') and res.get('sched') and len(res.get('unread') or {}) == 11 and all(res['unread'].values()))
+              and res.get('unread_hdr') and res.get('sched') and len(res.get('unread') or {}) == 11 and all(res['unread'].values())
+              and len(res.get('prog') or {}) == 8 and all(res['prog'].values()))
         print(f"SMOKE {'OK' if ok else 'FAIL'} sessions={res.get('sessions')} rows={res.get('rows')} "
               f"alerts={res.get('alerts')} show={res.get('shown')} size={res.get('w')}x{res.get('h')} "
               f"fit={res.get('fit')} drag={res.get('drag')} running-mode lines={res.get('lines')} "
@@ -6084,7 +7187,7 @@ def smoke(port: int, seconds: float) -> int:
               f"needs-you rows={res.get('attn_rows')} lines={res.get('attn_lines')} pulse-frames={res.get('frames')} "
               f"header-pulse={res.get('hdr')} attention-alerts={res.get('attn_alerts')} sounds={res.get('sounds')} "
               f"unread-header={res.get('unread_hdr')} scheduled-dim={res.get('sched')} unread={res.get('unread')} "
-              f"close-guard={res.get('close_guard')}")
+              f"progress={res.get('prog')} close-guard={res.get('close_guard')}")
         return 0 if ok else 1
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
