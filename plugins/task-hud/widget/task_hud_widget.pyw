@@ -424,13 +424,31 @@ def unread_set(sessions, marks: dict, now: int) -> set:
             if shows_unread(s, marks) and not s.get('scheduled') and now - done_key(s) < RECENT_MS}
 
 
+def asks_only(s: dict) -> bool:
+    """「Claude 在問你」：回合已經結束、最後一句是問句，沒有東西卡著等你。"""
+    return s.get('status') == 'attention' and (s.get('attn') or {}).get('reason') == 'question'
+
+
+def dismissable(s: dict) -> bool:
+    """可以標為已讀／從清單移除：沒在執行，或只是 Claude 在問你。"""
+    return s.get('status') not in ACTIVE or asks_only(s)
+
+
+def settle_read(s: dict, marks: dict) -> dict:
+    """「Claude 在問你」被標為已讀（之後沒有新的完成）：當成看過的閒置工作階段。"""
+    m = marks.get(s.get('sid'))
+    if asks_only(s) and m is not None and done_key(s) <= m + MARK_SLACK_MS:
+        return dict(s, status='idle', attn=None, unread=False)
+    return s
+
+
 def prune_marks(marks: dict, sessions, now: int) -> bool:
     """標為已讀的作廢：那個工作階段又開始做事（下次完成是新的一次）、完成時間變新，或超過 MARK_KEEP_MS。有變動回傳 True。"""
     by = {s.get('sid'): s for s in sessions}
     drop = []
     for sid, at in marks.items():
         s = by.get(sid)
-        if now - at > MARK_KEEP_MS or (s is not None and (s.get('status') in ACTIVE or done_key(s) > at + MARK_SLACK_MS)):
+        if now - at > MARK_KEEP_MS or (s is not None and (not dismissable(s) or done_key(s) > at + MARK_SLACK_MS)):
             drop.append(sid)
     for sid in drop:
         del marks[sid]
@@ -446,7 +464,7 @@ def act_key(s: dict) -> int:
 
 def is_hidden(s: dict, hidden: dict) -> bool:
     at = hidden.get(s.get('sid'))
-    return at is not None and s.get('status') not in ACTIVE and act_key(s) <= at + MARK_SLACK_MS
+    return at is not None and dismissable(s) and act_key(s) <= at + MARK_SLACK_MS
 
 
 def prune_hidden(hidden: dict, sessions, now: int) -> bool:
@@ -3930,7 +3948,8 @@ class App:
     def render(self, snap):
         now = now_ms()
         t = time.time()
-        sessions = [s for s in (snap['sessions'] if snap else []) if not is_hidden(s, self.cfg['hidden'])]
+        sessions = [settle_read(s, self.cfg['readMarks']) for s in (snap['sessions'] if snap else [])
+                    if not is_hidden(s, self.cfg['hidden'])]
         self.flash = {k: v for k, v in self.flash.items() if v[0] > t}
         mode = self.cfg['mode']
         run = sum(1 for s in sessions if s['status'] == 'running')
@@ -4320,7 +4339,7 @@ class App:
     def hide_session(self, sid) -> None:
         """從清單移除：只記在懸浮視窗自己的設定裡；這個工作階段再有新動作就重新出現。"""
         s = self._by_sid.get(sid) if sid else None
-        if s is None or s['status'] in ACTIVE:
+        if s is None or not dismissable(s):
             return
         self.cfg['hidden'][sid] = act_key(s) or now_ms()
         cap_marks(self.cfg['hidden'])
@@ -4338,8 +4357,8 @@ class App:
             return self.menu
         self._menu_sid = sid
         self.row_menu.entryconfigure(0, state='normal' if desktop_url(s.get('localId')) else 'disabled')
-        self.row_menu.entryconfigure(1, state='normal' if sid in self._dots else 'disabled')
-        self.row_menu.entryconfigure(2, state='disabled' if s['status'] in ACTIVE else 'normal')
+        self.row_menu.entryconfigure(1, state='normal' if sid in self._dots or asks_only(s) else 'disabled')
+        self.row_menu.entryconfigure(2, state='normal' if dismissable(s) else 'disabled')
         return self.row_menu
 
     def _popup(self, e):
@@ -6735,6 +6754,13 @@ def selftest_desktop(tmp: str, check, fx: dict) -> None:
           and not is_hidden(hs, {}), 'hidden session')
     check(not prune_hidden(hid, [hs], 1_000_001) and prune_hidden(hid, [dict(hs, lastAt=1_100_000)], 1_100_001) and hid == {}, 'hidden pruned')
     check(not prune_hidden({'gone': 5}, [], 6) and prune_hidden({'gone': 5}, [], 5 + MARK_KEEP_MS + 1), 'hidden expires')
+    q = {'sid': 'q1', 'status': 'attention', 'attn': {'reason': 'question'}, 'doneAt': 2_000_000, 'lastAt': 2_000_000, 'unread': True}
+    check(asks_only(q) and dismissable(q) and not dismissable(dict(q, attn={'reason': 'permission'})), 'question attention dismissable')
+    qm = {'q1': 2_000_000}
+    check(settle_read(q, qm)['status'] == 'idle' and not settle_read(q, qm)['unread'] and settle_read(q, {}) is q
+          and settle_read(dict(q, doneAt=2_100_000), qm)['status'] == 'attention', 'question marked read settles to idle')
+    check(not prune_marks(qm, [q], 2_000_001) and qm == {'q1': 2_000_000}, 'question mark kept')
+    check(is_hidden(q, {'q1': 2_000_000}) and not is_hidden(dict(q, attn={'reason': 'ask'}), {'q1': 2_000_000}), 'question removable')
     write_json(cfgq, {'hidden': {'a': 5, 'b': 'x'}})
     check(load_config(cfgq)['hidden'] == {'a': 5}, 'hidden cleaned on load')
 
